@@ -317,9 +317,10 @@ map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-
 map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right');
 const SMALL = window.matchMedia('(max-width: 760px)');
 // Quellenhinweis auf dem Handy eingeklappt starten (ein Tipp auf das i öffnet ihn)
-map.once('load', () => {
+map.once('idle', () => {
 	if (SMALL.matches) document.querySelector('.maplibregl-ctrl-attrib')?.classList.remove('maplibregl-compact-show');
 });
+if (SMALL.matches) setTimeout(() => document.querySelector('.maplibregl-ctrl-attrib')?.classList.remove('maplibregl-compact-show'), 4000);
 // Höhe des unteren Panels als CSS-Variable, damit Karten-Elemente darüber sitzen
 new ResizeObserver(([entry]) => {
 	document.documentElement.style.setProperty('--bottom-h', `${Math.round(entry.target.offsetHeight)}px`);
@@ -1056,11 +1057,21 @@ loadMeta().catch((err) => {
 	toast('Wetterkarte konnte nicht geladen werden – bitte später neu laden.', 8000);
 });
 locate({ silent: true });
-map.on('load', () => {
-	map.setTerrain(TERRAIN);
+// Wetterebenen starten, sobald der Kartenstil steht – nicht erst, wenn alle
+// Satellitenkacheln da sind (das dauert bei langsamer Verbindung lange).
+function startLayers() {
+	if (state.ready) return;
+	try {
+		map.setTerrain(TERRAIN);
+	} catch {
+		return; // Stil noch nicht bereit; das nächste Ereignis versucht es erneut
+	}
 	state.ready = true;
+	map.off('styledata', startLayers);
 	updateViewMode();
 	refreshLayers();
-});
+}
+map.on('styledata', startLayers);
+map.once('load', startLayers);
 // neuen Modelllauf übernehmen, wenn die Seite lange offen bleibt
 setInterval(() => loadMeta().catch(() => {}), 20 * 60 * 1000);
