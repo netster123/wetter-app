@@ -28,8 +28,11 @@
 						<path d="M12 1v3M12 20v3M1 12h3M20 12h3" />
 					</svg>
 				</button>
+				<button id="toggleTop" class="fold" aria-expanded="true" title="Oberes Menü ein- oder ausklappen">▴</button>
 				<ul id="results" hidden></ul>
 			</div>
+
+			<div id="alerts" class="alerts"></div>
 
 			<section class="now glass" id="now">
 				<div class="place"><span id="placeName">Standort wird ermittelt …</span><small id="placeSub"></small></div>
@@ -38,6 +41,12 @@
 					<span id="nowTemp" class="temp">–°</span>
 				</div>
 				<div id="nowDesc" class="desc">&nbsp;</div>
+				<div id="nowcast" class="nowcast" hidden>
+					<div id="nowcastText" class="nowcastText"></div>
+					<div id="nowcastBars" class="bars"></div>
+					<div id="nowcastAxis" class="barsAxis"></div>
+				</div>
+				<small id="warnState" class="warnState" hidden></small>
 				<dl class="facts">
 					<div><dt>Gefühlt</dt><dd id="nowFeels">–</dd></div>
 					<div><dt>Regen</dt><dd id="nowRain">–</dd></div>
@@ -50,6 +59,7 @@
 
 			<section class="layers glass">
 				<div class="chips" id="layerChips">
+					<button data-layer="radar">📡 Radar</button>
 					<button data-layer="rain" class="on">🌧️ Regen</button>
 					<button data-layer="clouds" class="on">☁️ Wolken</button>
 					<button data-layer="wind">💨 Wind</button>
@@ -61,9 +71,11 @@
 				</div>
 				<div id="legend" class="legend"></div>
 			</section>
+
 		</aside>
 
 		<section class="bottom glass">
+			<button id="toggleBottom" class="fold" aria-expanded="true" title="Unteres Menü ein- oder ausklappen">▾ Einklappen</button>
 			<div class="timeline">
 				<button id="rew" class="wind" title="Zurückspulen (nochmal klicken: schneller)" aria-label="Zurückspulen">◀◀</button>
 				<button id="play" title="Abspielen" aria-label="Abspielen">▶</button>
@@ -78,8 +90,13 @@
 				</div>
 				<button id="nowBtn" title="Zur aktuellen Zeit springen">Jetzt</button>
 			</div>
+			<div id="radarInfo" class="radarInfo" hidden></div>
 			<div id="days" class="days"></div>
 			<div id="hours" class="hours"></div>
+			<div class="credits">
+				Wetterdaten: <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> (CC BY 4.0), Deutscher Wetterdienst · Warnungen:
+				<a href="https://brightsky.dev/" target="_blank" rel="noopener">Bright Sky</a> · Radar: DWD
+			</div>
 		</section>
 
 		<div id="toast" class="toast" hidden></div>

@@ -702,3 +702,296 @@ button {
 		border-radius: 16px;
 	}
 }
+
+/* ---------- Menüs einklappen, damit die Karte frei ist ---------- */
+.fold {
+	flex: none;
+	align-self: flex-start;
+	padding: 5px 12px;
+	border-radius: 999px;
+	font-size: 12px;
+	color: var(--muted);
+	white-space: nowrap;
+}
+
+.fold:hover {
+	color: var(--text);
+}
+
+.bottom > .fold {
+	display: block;
+	margin: -4px auto 4px;
+	padding: 2px 14px;
+}
+
+body.top-collapsed .side > :not(.fold) {
+	display: none;
+}
+
+body.top-collapsed .side {
+	width: auto;
+	right: auto;
+}
+
+body.bottom-collapsed .bottom > :not(.fold) {
+	display: none;
+}
+
+body.bottom-collapsed .bottom {
+	left: 50%;
+	right: auto;
+	transform: translateX(-50%);
+	padding: 4px 6px;
+	border-radius: 999px;
+}
+
+body.bottom-collapsed .bottom > .fold {
+	margin: 0;
+	padding: 4px 12px;
+	color: var(--text);
+}
+
+body.top-collapsed .side > .fold {
+	color: var(--text);
+}
+
+/* ---------- Warnungen, Regen in 2 Stunden, Radar ---------- */
+.alerts {
+	display: grid;
+	gap: 6px;
+	flex: none;
+}
+
+.alerts:empty {
+	display: none;
+}
+
+.alert {
+	padding: 9px 12px;
+	border-left: 6px solid #ffd60a;
+}
+
+.alert.sev2 {
+	border-left-color: #ff9500;
+}
+
+.alert.sev3 {
+	border-left-color: #ff3b30;
+	background: rgba(90, 16, 16, 0.82);
+}
+
+.alert.sev4 {
+	border-left-color: #bf5af2;
+	background: rgba(64, 16, 90, 0.85);
+}
+
+.alert summary {
+	cursor: pointer;
+	list-style: none;
+}
+
+.alert summary::-webkit-details-marker {
+	display: none;
+}
+
+.alert summary small {
+	display: block;
+	color: var(--muted);
+	font-size: 12px;
+}
+
+.alert p {
+	margin: 8px 0 0;
+	font-size: 13px;
+	white-space: pre-line;
+}
+
+.alert p.src {
+	color: var(--muted);
+	font-size: 11px;
+}
+
+.nowcast {
+	margin: 0 0 12px;
+}
+
+.nowcastText {
+	font-weight: 600;
+}
+
+.bars {
+	display: flex;
+	align-items: flex-end;
+	gap: 3px;
+	height: 34px;
+	margin-top: 6px;
+}
+
+.bars i {
+	flex: 1;
+	border-radius: 3px 3px 0 0;
+	background: rgba(255, 255, 255, 0.14);
+}
+
+.bars i.wet {
+	background: var(--rain);
+}
+
+.barsAxis {
+	display: flex;
+	justify-content: space-between;
+	margin-top: 2px;
+	font-size: 10px;
+	color: var(--muted);
+	font-variant-numeric: tabular-nums;
+}
+
+.warnState {
+	display: block;
+	margin: -4px 0 10px;
+	color: var(--muted);
+}
+
+.warnState[hidden],
+.nowcast[hidden],
+.radarInfo[hidden] {
+	display: none;
+}
+
+.radarInfo {
+	margin-top: 6px;
+	font-size: 12px;
+	color: var(--muted);
+}
+
+.radarInfo .arrow {
+	display: inline-block;
+	color: var(--text);
+	font-weight: 700;
+}
+
+.radarLegend {
+	max-width: 100%;
+	max-height: 150px;
+	margin-top: 4px;
+	border-radius: 6px;
+	background: #fff;
+}
+
+.ticks .nowTick {
+	color: var(--text);
+	border-left-color: var(--accent);
+}
+
+.credits {
+	margin-top: 4px;
+	font-size: 10px;
+	color: var(--muted);
+	white-space: nowrap;
+	overflow-x: auto;
+	scrollbar-width: none;
+}
+
+.credits a {
+	color: inherit;
+}
+
+@media (max-width: 760px) {
+	.nowcast {
+		grid-column: 1 / -1;
+		margin: 6px 0 0;
+	}
+
+	.bars {
+		height: 22px;
+	}
+
+	.warnState {
+		grid-column: 1 / -1;
+		margin: 4px 0 0;
+		font-size: 11px;
+	}
+
+	.alert {
+		padding: 7px 10px;
+	}
+
+	.alert p {
+		max-height: 30vh;
+		overflow-y: auto;
+	}
+}
+
+.moreAlerts {
+	display: grid;
+	gap: 6px;
+}
+
+.moreAlerts > summary {
+	cursor: pointer;
+	list-style: none;
+	padding: 2px 12px;
+	font-size: 12px;
+	color: var(--text);
+	text-shadow: 0 1px 3px #000;
+}
+
+.moreAlerts > summary::-webkit-details-marker {
+	display: none;
+}
+
+.moreAlerts[open] > summary {
+	margin-bottom: 6px;
+}
+
+.moreAlerts .alert + .alert {
+	margin-top: 6px;
+}
+
+@media (max-width: 760px) {
+	/* Quellenhinweis auf dem Handy vollständig lesbar umbrechen */
+	.credits {
+		white-space: normal;
+	}
+}
+
+/* Einklapp-Knöpfe: immer sichtbar (oben in der Suchzeile, unten am Panelrand) und gut erkennbar */
+.fold {
+	color: var(--text);
+	background: rgba(255, 255, 255, 0.12);
+	font-size: 13px;
+}
+
+.search > .fold {
+	align-self: center;
+	height: 38px;
+	min-width: 38px;
+	margin-left: 4px;
+	padding: 0 10px;
+	border-radius: 12px;
+	font-size: 15px;
+}
+
+.bottom > .fold {
+	margin: -2px auto 6px;
+	padding: 4px 16px;
+}
+
+body.top-collapsed .side > :not(.search),
+body.top-collapsed .search > :not(.fold) {
+	display: none;
+}
+
+body.top-collapsed .side > .search {
+	display: flex;
+	padding: 4px;
+}
+
+body.top-collapsed .search > .fold {
+	margin: 0;
+	font-size: 13px;
+}
+
+body.bottom-collapsed .bottom > .fold {
+	background: none;
+}

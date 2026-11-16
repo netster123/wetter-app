@@ -20,12 +20,23 @@ const MAP_DOMAIN = 'dwd_icon_seamless'; // ICON-D2 → ICON-EU → ICON global
 const FORECAST_API = 'https://api.open-meteo.com/v1/forecast';
 const GEOCODE_API = 'https://geocoding-api.open-meteo.com/v1/search';
 const REVERSE_API = 'https://nominatim.openstreetmap.org/reverse';
+const ALERTS_API = 'https://api.brightsky.dev/alerts'; // amtliche DWD-Warnungen
+// Regenradar: Kartendienst des DWD, Radarkomposit 1 km, alle 5 Minuten,
+// Messung plus 2 Stunden Kurzfrist-Vorhersage
+const RADAR_WMS = 'https://maps.dwd.de/geoserver/dwd';
+const RADAR_LAYER = 'Radar_wn-product_1x1km_ger';
+const RADAR_BOUNDS = [1.4, 45.6, 18.8, 56.3]; // Abdeckung: Deutschland und Umgebung
+const RADAR_STEP = 5 * 60e3;
+const RADAR_PAST = 90 * 60e3;
+const RADAR_FUTURE = 120 * 60e3;
+const TZ = 'Europe/Berlin';
 
 const LAYERS = {
 	temp: { variable: 'temperature_2m', opacity: 0.6 },
 	wind: { variable: 'wind_u_component_10m', opacity: 0.65, arrows: true },
 	clouds: { variable: 'cloud_cover', opacity: 0.85 },
-	rain: { variable: 'precipitation', opacity: 0.9 }
+	rain: { variable: 'precipitation', opacity: 0.9 },
+	radar: { opacity: 0.8, fixed: true } // eigene Zeitachse, siehe setAxis()
 };
 
 const LEGENDS = {
@@ -93,19 +104,75 @@ const num = (v, digits = 0) =>
 		? '–'
 		: v.toLocaleString('de-DE', { minimumFractionDigits: digits, maximumFractionDigits: digits });
 const COMPASS = ['N', 'NO', 'O', 'SO', 'S', 'SW', 'W', 'NW'];
+const TOWARDS = ['Norden', 'Nordosten', 'Osten', 'Südosten', 'Süden', 'Südwesten', 'Westen', 'Nordwesten'];
+
+/* ------------------------------------------------------------------ *
+ *  Zwischenspeicher für API-Abrufe: Antworten werden für eine gewisse Zeit
+ *  im Arbeitsspeicher und im Browser (localStorage) behalten, damit die App
+ *  nicht unnötig oft abfragt. Fällt eine Quelle aus, wird die letzte
+ *  bekannte Antwort weiterverwendet.
+ * ------------------------------------------------------------------ */
+const CACHE_PREFIX = 'wx:';
+const memCache = new Map();
+async function cachedJson(url, ttlMs) {
+	const key = CACHE_PREFIX + url;
+	const now = Date.now();
+	let hit = memCache.get(key);
+	if (!hit) {
+		try {
+			hit = JSON.parse(localStorage.getItem(key));
+		} catch {}
+	}
+	if (hit?.promise) return hit.promise;
+	if (hit && now - hit.t < ttlMs) return hit.d;
+	const promise = fetch(url).then((res) => {
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+		return res.json();
+	});
+	memCache.set(key, { t: now, promise });
+	try {
+		const d = await promise;
+		memCache.set(key, { t: now, d });
+		try {
+			localStorage.setItem(key, JSON.stringify({ t: now, d }));
+		} catch {}
+		return d;
+	} catch (err) {
+		memCache.delete(key);
+		if (hit?.d && now - hit.t < 6 * 3.6e6) return hit.d; // veraltet, aber besser als nichts
+		throw err;
+	}
+}
+// alte Einträge beim Start aufräumen
+try {
+	for (const key of Object.keys(localStorage)) {
+		if (!key.startsWith(CACHE_PREFIX)) continue;
+		let t = 0;
+		try {
+			t = JSON.parse(localStorage.getItem(key)).t;
+		} catch {}
+		if (Date.now() - t > 6 * 3.6e6) localStorage.removeItem(key);
+	}
+} catch {}
 
 /* ------------------------------------------------------------------ *
  *  Zustand
  * ------------------------------------------------------------------ */
 const state = {
 	meta: null, // { reference_time, valid_times }
-	steps: [], // Zeitschritte der Karte, wie sie im Dateinamen stehen
-	times: [], // dieselben Zeitschritte als epoch ms
+	// Zwei Zeitachsen: 'model' (Vorhersagekarte, stündlich, 5 Tage) und 'radar'
+	// (5-Minuten-Schritte, 90 min zurück bis 2 h voraus). times/timeIndex
+	// gehören immer zur gerade aktiven Achse.
+	axis: 'model',
+	model: { steps: [], times: [], index: 0 },
+	radar: { times: [], index: 0, latest: 0 },
+	times: [],
 	timeIndex: 0,
 	enabled: new Set(['rain', 'clouds']),
 	target: 0, // Zeitschritt, den die Karte zeigen soll
 	pos: 0, // Wiedergabeposition (Zeitschritt mit Nachkommaanteil)
 	playing: false,
+	scrubbing: false, // Regler wird gerade von Hand gezogen
 	dir: 1, // Laufrichtung der Wiedergabe: 1 vorwärts, -1 rückwärts
 	speed: 1, // Spul-Faktor
 	rolling: false, // Wiedergabe läuft (genug gepuffert)
@@ -113,7 +180,9 @@ const state = {
 	insideD2: false, // Kartenausschnitt liegt ganz im ICON-D2-Gebiet
 	waiting: false,
 	seq: 0,
-	tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+	tz: TZ,
+	steer: null, // Höhenwind am Ort: Zugrichtung der Niederschlagsgebiete
+	alertReq: 0,
 	point: null,
 	marker: null,
 	forecastReq: 0,
@@ -188,6 +257,7 @@ const style = {
 		anchor('anchor-wind'),
 		anchor('anchor-clouds'),
 		anchor('anchor-rain'),
+		anchor('anchor-radar'),
 		{
 			id: 'roads-minor',
 			type: 'line',
@@ -336,8 +406,8 @@ const pad = (n) => String(n).padStart(2, '0');
 function omUrl(variable, index, domain, extra = '') {
 	const ref = new Date(state.meta.reference_time);
 	const run = `${ref.getUTCFullYear()}/${pad(ref.getUTCMonth() + 1)}/${pad(ref.getUTCDate())}/${pad(ref.getUTCHours())}${pad(ref.getUTCMinutes())}Z`;
-	const file = state.steps[index].replace(':', '').replace('Z', '');
-	const t = state.times;
+	const file = state.model.steps[index].replace(':', '').replace('Z', '');
+	const t = state.model.times;
 	const prev = index > 0 ? t[index - 1] : Date.parse(state.meta.reference_time);
 	const dt = Math.max(1, Math.round((t[index] - prev) / 3.6e6));
 	return `om://${SPATIAL}/${domain}/${run}/${file}.om?variable=${variable}&delta_time_hours=${dt}${extra}`;
@@ -346,6 +416,9 @@ function omUrl(variable, index, domain, extra = '') {
 // bei starkem Hineinzoomen tritt das Wetter zugunsten des Satellitenbilds zurück
 const zoomOpacity = (o) => ['interpolate', ['linear'], ['zoom'], 10, o, 15, o * 0.45];
 const opacityAt = (o, zoom) => o * (1 - 0.55 * Math.min(1, Math.max(0, (zoom - 10) / 5)));
+// Radar bleibt auch nah herangezoomt gut sichtbar
+const layerOpacityAt = (cfg, zoom) => (cfg.fixed ? cfg.opacity : opacityAt(cfg.opacity, zoom));
+const layerOpacityExpr = (cfg) => (cfg.fixed ? cfg.opacity : zoomOpacity(cfg.opacity));
 
 // Nur den sichtbaren Kartenausschnitt aus den Modell-Dateien laden – das macht
 // jedes Einzelbild klein genug, um die Wiedergabe im Voraus zu puffern.
@@ -362,9 +435,9 @@ map.on('dataloading', syncBounds);
  * übergeblendet, sodass Regen und Wolken fließend ziehen statt zu springen.
  */
 const frames = Object.fromEntries(Object.keys(LAYERS).map((k) => [k, new Map()])); // key → Map(index → frame)
-const STEP_MS = 420; // Wiedergabe: Dauer eines Zeitschritts bei vollem Puffer
+const stepMs = () => (state.axis === 'radar' ? 260 : 420); // Wiedergabe: Dauer eines Zeitschritts bei vollem Puffer
 const FADE_MS = 280; // Überblenden beim manuellen Zeitwechsel
-const lookahead = () => (SMALL.matches ? 3 : state.enabled.size <= 2 ? 6 : 3); // Handy: weniger Speicher
+const lookahead = () => (state.axis === 'radar' ? (SMALL.matches ? 4 : 8) : SMALL.matches ? 3 : state.enabled.size <= 2 ? 6 : 3); // Handy: weniger Speicher
 
 // Liegt der ganze Kartenausschnitt im Gebiet von ICON-D2 (Mitteleuropa, 48 h),
 // wird nur dieses Modell geladen statt zusätzlich ICON-EU und ICON global –
@@ -379,17 +452,31 @@ function updateViewMode() {
 }
 map.on('moveend', updateViewMode);
 function domainFor(index) {
-	const lead = (state.times[index] - Date.parse(state.meta.reference_time)) / 3.6e6;
+	if (state.axis === 'radar') return 'radar';
+	const lead = (state.model.times[index] - Date.parse(state.meta.reference_time)) / 3.6e6;
 	return state.insideD2 && lead <= D2.hours ? D2.domain : MAP_DOMAIN;
 }
-const frameKey = (index) => `${domainFor(index)}:${index}`;
+// Radarbilder werden über ihre Uhrzeit erkannt, weil sich die Zeitachse alle 5 Minuten verschiebt
+const frameKey = (index) => (state.axis === 'radar' ? `radar:${state.times[index]}` : `${domainFor(index)}:${index}`);
 
 function makeFrame(key, index) {
 	const cfg = LAYERS[key];
 	const domain = domainFor(index);
 	const id = `wx-${key}-${++state.seq}`;
-	const frame = { key, index, mapKey: frameKey(index), id, arrowsId: null, loaded: false, factor: 0, shown: 0, arrowsShown: 0, settled: false };
-	map.addSource(id, { type: 'raster', url: omUrl(cfg.variable, index, domain) });
+	const frame = { key, index, time: state.times[index], mapKey: frameKey(index), id, arrowsId: null, loaded: false, factor: 0, shown: 0, arrowsShown: 0, settled: false };
+	if (key === 'radar') {
+		const time = new Date(frame.time).toISOString();
+		map.addSource(id, {
+			type: 'raster',
+			tiles: [
+				`${RADAR_WMS}/wms?service=WMS&version=1.3.0&request=GetMap&layers=dwd:${RADAR_LAYER}&styles=&format=image/png&transparent=true&crs=EPSG:3857&width=512&height=512&bbox={bbox-epsg-3857}&time=${time}`
+			],
+			tileSize: 512,
+			bounds: RADAR_BOUNDS,
+			maxzoom: 10,
+			attribution: 'Radar © Deutscher Wetterdienst'
+		});
+	} else map.addSource(id, { type: 'raster', url: omUrl(cfg.variable, index, domain) });
 	map.addLayer(
 		{
 			id,
@@ -443,7 +530,10 @@ function makeFrame(key, index) {
 		if (e.tile) sawTile = true;
 		if (sawTile && map.isSourceLoaded(id)) done();
 	};
-	const timer = setTimeout(done, 12000); // nie ewig auf ein Bild warten
+	// nie ewig auf ein Bild warten; außerhalb des Radargebiets gibt es nichts zu laden
+	const b = map.getBounds();
+	const outside = key === 'radar' && (b.getEast() < RADAR_BOUNDS[0] || b.getWest() > RADAR_BOUNDS[2] || b.getNorth() < RADAR_BOUNDS[1] || b.getSouth() > RADAR_BOUNDS[3]);
+	const timer = setTimeout(done, outside ? 0 : 12000);
 	frame.stop = () => {
 		clearTimeout(timer);
 		map.off('sourcedata', onData);
@@ -469,7 +559,7 @@ function resetFrames() {
 function applyOpacity(frame, factor, zoom) {
 	frame.factor = factor;
 	frame.settled = false;
-	const v = Math.round(factor * opacityAt(LAYERS[frame.key].opacity, zoom) * 500) / 500;
+	const v = Math.round(factor * layerOpacityAt(LAYERS[frame.key], zoom) * 500) / 500;
 	if (v !== frame.shown) {
 		frame.shown = v;
 		map.setPaintProperty(frame.id, 'raster-opacity', v);
@@ -485,7 +575,9 @@ function applyOpacity(frame, factor, zoom) {
 }
 
 function setWaiting(waiting) {
-	const text = !waiting ? 'Kartenzeit' : state.playing ? 'Puffert …' : 'Karte lädt …';
+	let text = 'Kartenzeit';
+	if (waiting) text = state.playing ? 'Puffert …' : 'Karte lädt …';
+	else if (state.axis === 'radar') text = state.times[state.timeIndex] > state.radar.latest ? 'Radar · Vorhersage' : 'Radar · Messung';
 	if (state.waiting === waiting && $('timeHint').textContent === text) return;
 	state.waiting = waiting;
 	$('play').classList.toggle('loading', waiting);
@@ -502,12 +594,13 @@ function tick(now) {
 	raf = 0;
 	const dt = lastTick ? Math.min(64, now - lastTick) : 16;
 	lastTick = 0;
-	if (!state.meta || !state.ready) return;
 	const n = state.times.length;
+	if (!state.ready || !n || (state.axis === 'model' && !state.meta)) return;
 	const zoom = map.getZoom();
-	const keys = Object.keys(LAYERS).filter((k) => state.enabled.has(k));
+	// Im Radar-Modus ist nur das Radar zu sehen, sonst die gewählten Vorhersage-Ebenen
+	const keys = state.axis === 'radar' ? ['radar'] : Object.keys(LAYERS).filter((k) => state.enabled.has(k));
 	for (const key of Object.keys(LAYERS)) {
-		if (!state.enabled.has(key)) for (const frame of [...frames[key].values()]) disposeFrame(frame);
+		if (!keys.includes(key)) for (const frame of [...frames[key].values()]) disposeFrame(frame);
 	}
 	const ensure = (indexes) => {
 		for (const key of keys) {
@@ -518,7 +611,40 @@ function tick(now) {
 	let busy = false;
 	let waiting = false;
 
-	if (state.playing) {
+	if (state.scrubbing) {
+		// Regler wird von Hand gezogen: Das Bild folgt der Position. Was schon
+		// geladen ist, wird sofort überblendet; der Rest lädt beim Ziehen nach.
+		const base = Math.min(n - 1, Math.floor(state.pos));
+		const next = Math.min(n - 1, base + 1);
+		const f = state.pos - base;
+		const near = [...new Set([base - 1, base, next, base + 2].filter((i) => i >= 0 && i < n))];
+		ensure(near);
+		const keep = new Set(near.map(frameKey));
+		for (const key of keys) {
+			const A = at(key, base);
+			const B = at(key, next);
+			const nearest = f < 0.5 ? A : B;
+			const all = [...frames[key].values()];
+			if (A.loaded && B.loaded) {
+				for (const fr of all) {
+					if (fr === A) applyOpacity(fr, A === B ? 1 : 1 - f, zoom);
+					else if (fr === B) applyOpacity(fr, f, zoom);
+					else if (keep.has(fr.mapKey)) applyOpacity(fr, 0, zoom);
+					else disposeFrame(fr);
+				}
+			} else if (nearest.loaded) {
+				for (const fr of all) {
+					if (fr === nearest) applyOpacity(fr, 1, zoom);
+					else if (keep.has(fr.mapKey)) applyOpacity(fr, 0, zoom);
+					else disposeFrame(fr);
+				}
+			} else {
+				// noch nichts Passendes geladen: das bisherige Bild stehen lassen
+				waiting = true;
+				for (const fr of all) if (!keep.has(fr.mapKey) && fr.factor === 0) disposeFrame(fr);
+			}
+		}
+	} else if (state.playing) {
 		busy = true;
 		const ahead = lookahead();
 		const back = state.dir < 0;
@@ -553,7 +679,7 @@ function tick(now) {
 		// Wetter langsamer, aber gleichmäßig, statt zu rucken und zu stocken.
 		const wanted = state.rolling ? Math.min(1, Math.max(0.1, reserve / (ahead * 0.6))) : 0;
 		state.rate += (wanted - state.rate) * Math.min(1, dt / 500);
-		const advance = Math.min((dt / STEP_MS) * state.rate * state.speed, reserve);
+		const advance = Math.min((dt / stepMs()) * state.rate * state.speed, reserve);
 		state.pos = (((state.pos + state.dir * advance) % n) + n) % n;
 		waiting = keys.length > 0 && !state.rolling;
 
@@ -599,7 +725,7 @@ function tick(now) {
 				applyOpacity(target, 1, zoom);
 				for (const fr of others) disposeFrame(fr);
 				// ab jetzt regelt die Karte die Deckkraft selbst je nach Zoomstufe
-				map.setPaintProperty(target.id, 'raster-opacity', zoomOpacity(LAYERS[key].opacity));
+				map.setPaintProperty(target.id, 'raster-opacity', layerOpacityExpr(LAYERS[key]));
 				target.shown = -1;
 				target.settled = true;
 				busy = true; // noch eine Runde, um die nächsten Bilder vorzuladen
@@ -622,6 +748,11 @@ function refreshLayers() {
 }
 
 function renderLegend() {
+	if (state.axis === 'radar') {
+		// Farbskala direkt vom DWD-Kartendienst
+		$('legend').innerHTML = `<div class="row">Regenradar (DWD), Niederschlag in mm/h<br /><img class="radarLegend" crossorigin="anonymous" alt="Farbskala des Regenradars" src="${RADAR_WMS}/ows?service=WMS&version=1.3.0&request=GetLegendGraphic&format=image/png&layer=${RADAR_LAYER}" /></div>`;
+		return;
+	}
 	$('legend').innerHTML = [...state.enabled]
 		.map((key) => {
 			const l = LEGENDS[key];
@@ -646,18 +777,29 @@ function nearestIndex(ms) {
 
 function renderTimeline() {
 	const slider = $('time');
-	slider.max = state.times.length - 1;
+	const n = state.times.length;
+	slider.max = Math.max(1, n - 1);
 	slider.value = state.timeIndex;
-	const dayFmt = fmt({ weekday: 'short', day: '2-digit', month: '2-digit' });
-	let last = dayKey(state.times[0]);
+	const at = (i) => `left:${(i / Math.max(1, n - 1)) * 100}%`;
 	let html = '';
-	state.times.forEach((ms, i) => {
-		const k = dayKey(ms);
-		if (k === last) return;
-		last = k;
-		const [wd, date] = dayFmt.format(ms).split(', ');
-		html += `<span style="left:${(i / (state.times.length - 1)) * 100}%">${wd}<i>, ${date}</i></span>`;
-	});
+	if (state.axis === 'radar') {
+		// Radar: volle Stunden und die Grenze zwischen Messung und Vorhersage
+		const hm = fmt({ hour: '2-digit', minute: '2-digit' });
+		state.times.forEach((ms, i) => {
+			if (ms === state.radar.latest) html += `<span class="nowTick" style="${at(i)}">jetzt</span>`;
+			else if (ms % 3.6e6 === 0 && Math.abs(ms - state.radar.latest) > 20 * 60e3) html += `<span style="${at(i)}">${hm.format(ms)}</span>`;
+		});
+	} else {
+		const dayFmt = fmt({ weekday: 'short', day: '2-digit', month: '2-digit' });
+		let last = dayKey(state.times[0]);
+		state.times.forEach((ms, i) => {
+			const k = dayKey(ms);
+			if (k === last) return;
+			last = k;
+			const [wd, date] = dayFmt.format(ms).split(', ');
+			html += `<span style="${at(i)}">${wd}<i>, ${date}</i></span>`;
+		});
+	}
 	$('ticks').innerHTML = html;
 	renderTimeLabel();
 }
@@ -676,6 +818,7 @@ function renderTimeLabel() {
 	}
 	const k = dayKey(ms);
 	for (const el of document.querySelectorAll('.days button')) el.classList.toggle('on', el.dataset.day === k);
+	setWaiting(state.waiting); // Statuszeile nachführen (Radar: Messung/Vorhersage)
 	return active;
 }
 
@@ -736,16 +879,104 @@ async function loadMeta() {
 	if (!res.ok) throw new Error(`Modelldaten nicht erreichbar (${res.status})`);
 	const meta = await res.json();
 	if (state.meta && state.meta.reference_time === meta.reference_time) return;
-	const keepMs = state.meta ? state.times[state.timeIndex] : Date.now();
+	const m = state.model;
+	const shown = state.axis === 'model' ? state.timeIndex : m.index;
+	const keepMs = state.meta ? m.times[shown] : Date.now();
 	state.meta = meta;
 	// Der erste Zeitschritt ist der Startzustand des Modells und enthält noch keinen Niederschlag
-	state.steps = meta.valid_times.slice(1);
-	state.times = state.steps.map((t) => Date.parse(t.replace('Z', ':00Z')));
-	state.timeIndex = state.target = nearestIndex(keepMs);
+	m.steps = meta.valid_times.slice(1);
+	m.times = m.steps.map((t) => Date.parse(t.replace('Z', ':00Z')));
+	m.index = 0;
+	for (let i = 1; i < m.times.length; i++) if (Math.abs(m.times[i] - keepMs) < Math.abs(m.times[m.index] - keepMs)) m.index = i;
+	// Bilder des alten Modelllaufs verwerfen
+	for (const key of Object.keys(LAYERS)) if (key !== 'radar') for (const frame of [...frames[key].values()]) disposeFrame(frame);
+	if (state.axis !== 'model') return;
+	state.times = m.times;
+	state.timeIndex = state.target = m.index;
 	state.pos = state.timeIndex;
-	resetFrames(); // Bilder des alten Modelllaufs verwerfen
 	renderTimeline();
 	refreshLayers();
+}
+
+/** Zeitpunkte des Radars: 90 Minuten zurück bis 2 Stunden voraus, alle 5 Minuten. */
+async function loadRadarTimes() {
+	const r = state.radar;
+	let end = 0;
+	try {
+		// Der Kartendienst nennt den letzten verfügbaren Zeitpunkt (= Ende der Vorhersage)
+		const res = await fetch(`${RADAR_WMS}/${RADAR_LAYER}/wms?service=WMS&version=1.3.0&request=GetCapabilities`);
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+		const match = (await res.text()).match(/<Dimension name="time"[^>]*>[^<]*\/([^/<]+)\/PT5M\s*</);
+		end = match ? Date.parse(match[1]) : 0;
+	} catch (err) {
+		console.warn('Radar-Zeitangaben nicht erreichbar, rechne mit der Uhrzeit', err);
+	}
+	// Notlösung ohne Dienst: Messungen liegen meist rund 5 Minuten zurück
+	if (!end || Math.abs(end - RADAR_FUTURE - Date.now()) > 45 * 60e3) end = Math.floor((Date.now() - 5 * 60e3) / RADAR_STEP) * RADAR_STEP + RADAR_FUTURE;
+	const latest = end - RADAR_FUTURE;
+	if (latest === r.latest && r.times.length) return;
+	const shownMs = state.axis === 'radar' ? r.times[state.timeIndex] : null;
+	const wasLatest = shownMs === r.latest;
+	r.latest = latest;
+	r.times = [];
+	for (let t = latest - RADAR_PAST; t <= end; t += RADAR_STEP) r.times.push(t);
+	r.index = r.times.indexOf(latest);
+	if (state.axis !== 'radar') return;
+	// Achse hat sich verschoben: vorhandene Bilder ihrer neuen Position zuordnen
+	state.times = r.times;
+	for (const frame of [...frames.radar.values()]) {
+		const i = r.times.indexOf(frame.time);
+		if (i < 0) disposeFrame(frame);
+		else frame.index = i;
+	}
+	if (!state.playing) {
+		const i = wasLatest || shownMs == null ? r.index : Math.max(0, r.times.indexOf(shownMs));
+		state.timeIndex = state.target = i;
+		state.pos = i;
+	}
+	renderTimeline();
+	kick();
+}
+
+/** Zwischen Vorhersagekarte ('model') und Regenradar ('radar') umschalten. */
+async function setAxis(axis) {
+	if (state.axis === axis) return;
+	if (state.playing) setPlaying(false);
+	if (axis === 'radar') await loadRadarTimes();
+	state[state.axis].index = state.timeIndex;
+	state.axis = axis;
+	state.times = state[axis].times;
+	state.timeIndex = state.target = axis === 'radar' ? state.radar.times.indexOf(state.radar.latest) : state.model.index;
+	state.pos = state.timeIndex;
+	clearTimeout(timeDebounce);
+	renderChips();
+	renderLegend();
+	renderRadarInfo();
+	renderTimeline();
+	kick();
+}
+
+function renderChips() {
+	const radar = state.axis === 'radar';
+	for (const btn of document.querySelectorAll('#layerChips button')) {
+		const key = btn.dataset.layer;
+		btn.classList.toggle('on', key === 'radar' ? radar : !radar && state.enabled.has(key));
+	}
+}
+
+function renderRadarInfo() {
+	const box = $('radarInfo');
+	box.hidden = state.axis !== 'radar';
+	if (box.hidden) return;
+	const hm = fmt({ hour: '2-digit', minute: '2-digit' });
+	const r = state.radar;
+	const parts = [`Regenradar des DWD · Messung bis ${hm.format(r.latest)} Uhr, danach Vorhersage bis ${hm.format(r.times[r.times.length - 1])} Uhr`];
+	if (state.steer) {
+		// Niederschlagsgebiete ziehen grob mit dem Wind in etwa 3 km Höhe
+		const to = (state.steer.dir + 180) % 360;
+		parts.push(`Zugrichtung: <span class="arrow" style="transform:rotate(${to}deg)">↑</span> nach ${TOWARDS[Math.round(to / 45) % 8]}, etwa ${num(state.steer.speed)} km/h`);
+	}
+	box.innerHTML = parts.join(' · ');
 }
 
 /* ------------------------------------------------------------------ *
@@ -762,23 +993,29 @@ function toast(text, ms = 4500) {
 async function loadForecast(lat, lon) {
 	const req = ++state.forecastReq;
 	const params = new URLSearchParams({
-		latitude: lat.toFixed(4),
-		longitude: lon.toFixed(4),
+		latitude: lat.toFixed(3),
+		longitude: lon.toFixed(3),
 		current:
 			'temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,cloud_cover,wind_speed_10m,wind_direction_10m,wind_gusts_10m,is_day',
-		hourly: 'temperature_2m,precipitation,precipitation_probability,weather_code,is_day',
+		hourly: 'temperature_2m,precipitation,precipitation_probability,weather_code,is_day,wind_speed_700hPa,wind_direction_700hPa',
+		// 15-Minuten-Werte (in Mitteleuropa direkt aus ICON-D2) für den Regen der nächsten 2 Stunden
+		minutely_15: 'precipitation',
+		forecast_minutely_15: '9',
 		daily: 'weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum',
-		timezone: 'auto',
+		timezone: TZ,
 		timeformat: 'unixtime',
 		forecast_days: '7'
 	});
 	try {
-		const res = await fetch(`${FORECAST_API}?${params}`);
-		if (!res.ok) throw new Error(`HTTP ${res.status}`);
-		const data = await res.json();
+		// ICON-D2 rechnet nur alle 3 Stunden neu; 10 Minuten Zwischenspeicher reichen locker
+		const data = await cachedJson(`${FORECAST_API}?${params}`, 10 * 60e3);
 		if (req !== state.forecastReq) return;
-		state.tz = data.timezone || state.tz;
 		renderNow(data);
+		renderNowcast(data);
+		const h = data.hourly;
+		const i = h.time.findLastIndex((t) => t * 1000 <= Date.now());
+		state.steer = i >= 0 && h.wind_direction_700hPa?.[i] != null ? { dir: h.wind_direction_700hPa[i], speed: h.wind_speed_700hPa[i] } : null;
+		renderRadarInfo();
 		renderDays(data);
 		renderHours(data);
 		if (state.times.length) renderTimeline();
@@ -801,6 +1038,111 @@ function renderNow({ current: c }) {
 	$('nowGust').textContent = `${num(c.wind_gusts_10m)} km/h`;
 	$('nowCloud').textContent = `${num(c.cloud_cover)} %`;
 	$('nowHum').textContent = `${num(c.relative_humidity_2m)} %`;
+}
+
+/** Regen in den nächsten 2 Stunden: kurzer Satz plus Balken je 15 Minuten. */
+function renderNowcast({ minutely_15: m, current: c }) {
+	const box = $('nowcast');
+	const now = Date.now();
+	const slots = (m?.time || [])
+		.map((t, i) => ({ t: t * 1000, mm: m.precipitation[i] ?? 0 }))
+		.filter((s) => s.t + 15 * 60e3 > now)
+		.slice(0, 8);
+	box.hidden = slots.length < 4;
+	if (box.hidden) return;
+	const wet = (s) => s.mm >= 0.1;
+	const hm = fmt({ hour: '2-digit', minute: '2-digit' });
+	const peak = Math.max(...slots.map((s) => s.mm)) * 4; // mm pro Stunde
+	const snow = c?.temperature_2m <= 0.5;
+	const kind = snow ? (peak < 2.5 ? 'Leichter Schneefall' : peak < 10 ? 'Schneefall' : 'Starker Schneefall') : peak < 2.5 ? 'Leichter Regen' : peak < 10 ? 'Regen' : 'Starker Regen';
+	const firstWet = slots.findIndex(wet);
+	let text;
+	if (firstWet === -1) text = 'Die nächsten 2 Stunden trocken';
+	else if (firstWet > 0) text = `${kind} ab ${hm.format(slots[firstWet].t)} Uhr`;
+	else {
+		const firstDry = slots.findIndex((s) => !wet(s));
+		if (firstDry === -1) text = `${kind} hält die nächsten 2 Stunden an`;
+		else if (slots.slice(firstDry).some(wet)) text = `${kind}, Pause ab etwa ${hm.format(slots[firstDry].t)} Uhr`;
+		else text = `${kind} bis etwa ${hm.format(slots[firstDry].t)} Uhr`;
+	}
+	$('nowcastText').textContent = text;
+	const max = Math.max(0.5, ...slots.map((s) => s.mm));
+	$('nowcastBars').innerHTML = slots
+		.map((s) => `<i class="${wet(s) ? 'wet' : ''}" style="height:${wet(s) ? Math.max(30, (s.mm / max) * 100) : 8}%" title="${hm.format(s.t)} Uhr: ${num(s.mm, 1)} mm"></i>`)
+		.join('');
+	$('nowcastAxis').innerHTML = `<span>${hm.format(slots[0].t)}</span><span>${hm.format(slots[4].t)}</span><span>${hm.format(slots[slots.length - 1].t + 15 * 60e3)}</span>`;
+}
+
+/* ------------------------------------------------------------------ *
+ *  Amtliche Warnungen des DWD (über Bright Sky)
+ * ------------------------------------------------------------------ */
+const SEVERITY = {
+	minor: { rank: 1, label: 'Wetterwarnung' },
+	moderate: { rank: 2, label: 'Warnung vor markantem Wetter' },
+	severe: { rank: 3, label: 'Unwetterwarnung' },
+	extreme: { rank: 4, label: 'Warnung vor extremem Unwetter' }
+};
+const titleCase = (text) => (text || '').toLowerCase().replace(/(^|[\s-])(\p{L})/gu, (_, a, b) => a + b.toUpperCase());
+
+function alertElement(a) {
+	const sev = SEVERITY[a.severity] || SEVERITY.minor;
+	const when = fmt({ weekday: 'short', hour: '2-digit', minute: '2-digit' });
+	const onset = Date.parse(a.onset || a.effective);
+	const expires = a.expires ? Date.parse(a.expires) : null;
+	const el = document.createElement('details');
+	el.className = `alert glass sev${sev.rank}`;
+	const summary = document.createElement('summary');
+	const title = document.createElement('b');
+	title.textContent = `⚠️ ${titleCase(a.event_de) || 'Warnung'}`;
+	const time = document.createElement('small');
+	time.textContent = `${sev.label} · ${onset > Date.now() ? `ab ${when.format(onset)} Uhr` : 'jetzt'}${expires ? ` bis ${when.format(expires)} Uhr` : ''}`;
+	summary.append(title, time);
+	el.append(summary);
+	for (const text of [a.description_de, a.instruction_de]) {
+		if (!text) continue;
+		const p = document.createElement('p');
+		p.textContent = text;
+		el.append(p);
+	}
+	const src = document.createElement('p');
+	src.className = 'src';
+	src.textContent = 'Quelle: Deutscher Wetterdienst';
+	el.append(src);
+	return el;
+}
+
+async function loadAlerts(lat, lon) {
+	const req = ++state.alertReq;
+	const box = $('alerts');
+	const none = $('warnState');
+	try {
+		// Warnungen ändern sich selten im Minutentakt; 5 Minuten Zwischenspeicher
+		const data = await cachedJson(`${ALERTS_API}?lat=${lat.toFixed(2)}&lon=${lon.toFixed(2)}`, 5 * 60e3);
+		if (req !== state.alertReq) return;
+		const now = Date.now();
+		const alerts = (data.alerts || [])
+			.filter((a) => !a.expires || Date.parse(a.expires) > now)
+			.sort((a, b) => (SEVERITY[b.severity]?.rank || 0) - (SEVERITY[a.severity]?.rank || 0) || Date.parse(a.onset) - Date.parse(b.onset));
+		// Die zwei wichtigsten Warnungen direkt zeigen, weitere hinter einem Aufklapper
+		const items = alerts.map(alertElement);
+		const rest = items.splice(2);
+		if (rest.length) {
+			const more = document.createElement('details');
+			more.className = 'moreAlerts';
+			const summary = document.createElement('summary');
+			summary.textContent = rest.length === 1 ? '+ 1 weitere Warnung' : `+ ${rest.length} weitere Warnungen`;
+			more.append(summary, ...rest);
+			items.push(more);
+		}
+		box.replaceChildren(...items);
+		none.hidden = alerts.length > 0;
+		none.textContent = 'Keine amtlichen Warnungen (DWD)';
+	} catch {
+		// außerhalb Deutschlands gibt es keine DWD-Warnungen; bei Ausfall läuft der Rest weiter
+		if (req !== state.alertReq) return;
+		box.replaceChildren();
+		none.hidden = true;
+	}
 }
 
 function renderDays({ daily: d }) {
@@ -878,6 +1220,7 @@ async function selectPoint(lat, lon, { name, sub, gps = false, fly = true, zoom 
 	$('placeName').textContent = name || (gps ? 'Mein Standort' : `${num(lat, 2)}°, ${num(lon, 2)}°`);
 	$('placeSub').textContent = sub || '';
 	loadForecast(lat, lon);
+	loadAlerts(lat, lon);
 	if (!name) {
 		const r = await reverseName(lat, lon);
 		if (state.point.lat !== lat || state.point.lon !== lon || !r.name) return;
@@ -974,14 +1317,22 @@ map.on('click', (e) => selectPoint(e.lngLat.lat, e.lngLat.lng, { fly: false }));
 /* ------------------------------------------------------------------ *
  *  Bedienelemente
  * ------------------------------------------------------------------ */
-$('layerChips').addEventListener('click', (e) => {
+$('layerChips').addEventListener('click', async (e) => {
 	const btn = e.target.closest('button[data-layer]');
 	if (!btn) return;
 	const key = btn.dataset.layer;
-	const on = !state.enabled.has(key);
-	if (on) state.enabled.add(key);
-	else state.enabled.delete(key);
-	btn.classList.toggle('on', on);
+	if (key === 'radar') {
+		// Radar hat eine eigene Zeitachse (5-Minuten-Schritte) und ersetzt solange die Vorhersage-Ebenen
+		await setAxis(state.axis === 'radar' ? 'model' : 'radar');
+		return;
+	}
+	if (state.axis === 'radar') {
+		// zurück zur Vorhersagekarte, die gewählte Ebene ist dann sicher an
+		state.enabled.add(key);
+		await setAxis('model');
+	} else if (state.enabled.has(key)) state.enabled.delete(key);
+	else state.enabled.add(key);
+	renderChips();
 	kick();
 	renderLegend();
 });
@@ -998,10 +1349,59 @@ $('toggleLabels').addEventListener('click', (e) => {
 	for (const id of LABEL_LAYERS) map.setLayoutProperty(id, 'visibility', on ? 'visible' : 'none');
 });
 
-$('time').addEventListener('input', (e) => {
-	setPlaying(false);
-	setTimeIndex(Number(e.target.value), { scroll: true });
+// Regler von Hand ziehen: Das Kartenbild läuft stufenlos mit (vor und zurück).
+$('time').addEventListener('pointerdown', () => {
+	if (!state.times.length) return;
+	if (state.playing) setPlaying(false);
+	clearTimeout(timeDebounce);
+	state.scrubbing = true;
 });
+function endScrub() {
+	if (!state.scrubbing) return;
+	state.scrubbing = false;
+	// beim Loslassen auf dem nächstgelegenen Zeitschritt einrasten
+	setTimeIndex(Number($('time').value), { immediate: true, scroll: true });
+}
+$('time').addEventListener('change', endScrub);
+window.addEventListener('pointerup', endScrub);
+window.addEventListener('pointercancel', endScrub);
+$('time').addEventListener('input', (e) => {
+	const value = Number(e.target.value);
+	if (!state.scrubbing) {
+		// Tastatur o. Ä.: direkt zum Zeitschritt springen
+		if (state.playing) setPlaying(false);
+		return setTimeIndex(value, { scroll: true });
+	}
+	state.pos = Math.max(0, Math.min(state.times.length - 1, value));
+	const nearest = Math.round(state.pos);
+	if (nearest !== state.timeIndex) {
+		state.timeIndex = nearest;
+		renderTimeLabel()?.scrollIntoView({ inline: 'center', block: 'nearest' });
+	}
+	kick();
+});
+
+// Menüs ein- und ausklappen; die Wahl bleibt gespeichert
+for (const [id, cls, open, closed] of [
+	['toggleTop', 'top-collapsed', '▴', '▾ Menü'],
+	['toggleBottom', 'bottom-collapsed', '▾ Einklappen', '▴ Vorhersage & Zeitleiste']
+]) {
+	const btn = $(id);
+	const apply = (collapsed) => {
+		document.body.classList.toggle(cls, collapsed);
+		btn.textContent = collapsed ? closed : open;
+		btn.setAttribute('aria-expanded', String(!collapsed));
+		try {
+			localStorage.setItem(cls, collapsed ? '1' : '');
+		} catch {}
+	};
+	let saved = false;
+	try {
+		saved = localStorage.getItem(cls) === '1';
+	} catch {}
+	apply(saved);
+	btn.addEventListener('click', () => apply(!document.body.classList.contains(cls)));
+}
 $('play').addEventListener('click', () => setPlaying(!state.playing));
 $('rew').addEventListener('click', () => wind(-1));
 $('ffw').addEventListener('click', () => wind(1));
@@ -1024,7 +1424,9 @@ $('nowBtn').addEventListener('click', () => {
 	setTimeIndex(nearestIndex(Date.now()), { immediate: true, scroll: true });
 });
 
-function jumpTo(ms) {
+async function jumpTo(ms) {
+	// Stunden und Tage der Übersicht beziehen sich auf die Vorhersagekarte
+	if (state.axis === 'radar') await setAxis('model');
 	if (!state.times.length) return;
 	if (state.playing) setPlaying(false);
 	const last = state.times[state.times.length - 1];
@@ -1075,3 +1477,12 @@ map.on('styledata', startLayers);
 map.once('load', startLayers);
 // neuen Modelllauf übernehmen, wenn die Seite lange offen bleibt
 setInterval(() => loadMeta().catch(() => {}), 20 * 60 * 1000);
+// Radar, Warnungen und Vorhersage am gewählten Ort regelmäßig auffrischen
+setInterval(() => {
+	if (document.hidden) return;
+	if (state.axis === 'radar') loadRadarTimes();
+	if (state.point) {
+		loadForecast(state.point.lat, state.point.lon);
+		loadAlerts(state.point.lat, state.point.lon);
+	}
+}, 5 * 60 * 1000);
