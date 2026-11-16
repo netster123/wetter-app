@@ -29,6 +29,15 @@ const RADAR_BOUNDS = [1.4, 45.6, 18.8, 56.3]; // Abdeckung: Deutschland und Umge
 const RADAR_STEP = 5 * 60e3;
 const RADAR_PAST = 90 * 60e3;
 const RADAR_FUTURE = 120 * 60e3;
+// Satellitenbild: Kartendienst von EUMETSAT, Meteosat (MTG) „GeoColour“, alle
+// 10 Minuten. Tagsüber Echtfarben, nachts Wolken aus dem Infrarotkanal.
+const SAT_WMS = 'https://view.eumetsat.int/geoserver';
+const SAT_LAYER = 'mtg_fd:rgb_geocolour';
+// Achsen mit eigenen Zeitschritten (Messungen statt Modellvorhersage)
+const LIVE = {
+	radar: { step: 5 * 60e3, past: RADAR_PAST, future: RADAR_FUTURE, lag: 5 * 60e3, caps: `${RADAR_WMS}/${RADAR_LAYER}/wms`, name: 'Radar' },
+	sat: { step: 10 * 60e3, past: 180 * 60e3, future: 0, lag: 25 * 60e3, caps: `${SAT_WMS}/${SAT_LAYER.replace(':', '/')}/wms`, name: 'Satellit' }
+};
 const TZ = 'Europe/Berlin';
 
 const LAYERS = {
@@ -36,7 +45,8 @@ const LAYERS = {
 	wind: { variable: 'wind_u_component_10m', opacity: 0.65, arrows: true },
 	clouds: { variable: 'cloud_cover', opacity: 0.85 },
 	rain: { variable: 'precipitation', opacity: 0.9 },
-	radar: { opacity: 0.8, fixed: true } // eigene Zeitachse, siehe setAxis()
+	radar: { opacity: 0.8, fixed: true }, // eigene Zeitachse, siehe setAxis()
+	sat: { opacity: 1, fixed: true } // echte Wolken aus dem Satellitenbild, eigene Zeitachse
 };
 
 const LEGENDS = {
@@ -166,6 +176,7 @@ const state = {
 	axis: 'model',
 	model: { steps: [], times: [], index: 0 },
 	radar: { times: [], index: 0, latest: 0 },
+	sat: { times: [], index: 0, latest: 0 },
 	times: [],
 	timeIndex: 0,
 	enabled: new Set(['rain', 'clouds']),
@@ -213,6 +224,29 @@ settings.colorScales = {
 };
 maplibregl.addProtocol('om', (params, abort) => OM.omProtocol(params, abort, settings));
 
+// Satellitenbild → nur die Wolken: Der Dienst liefert ein fertiges Bild samt
+// Erdoberfläche. Helle, farblose Bildpunkte sind Wolken (oder Schnee); alles
+// andere wird durchsichtig, damit darunter die eigene Karte sichtbar bleibt.
+maplibregl.addProtocol('satcloud', async (params, abort) => {
+	const res = await fetch(params.url.replace('satcloud://', 'https://'), { signal: abort.signal });
+	if (!res.ok) throw new Error(`Satellitenbild: HTTP ${res.status}`);
+	const bmp = await createImageBitmap(await res.blob());
+	const canvas = typeof OffscreenCanvas === 'function' ? new OffscreenCanvas(bmp.width, bmp.height) : Object.assign(document.createElement('canvas'), { width: bmp.width, height: bmp.height });
+	const ctx = canvas.getContext('2d', { willReadFrequently: true });
+	ctx.drawImage(bmp, 0, 0);
+	bmp.close?.();
+	const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+	const d = img.data;
+	for (let i = 0; i < d.length; i += 4) {
+		const lo = Math.min(d[i], d[i + 1], d[i + 2]);
+		const hi = Math.max(d[i], d[i + 1], d[i + 2]);
+		const t = Math.min(1, Math.max(0, (lo - 0.6 * (hi - lo) - 70) / 105));
+		d[i + 3] = Math.round(255 * t * t * (3 - 2 * t));
+	}
+	ctx.putImageData(img, 0, 0);
+	return { data: await createImageBitmap(canvas) };
+});
+
 const NAME = ['coalesce', ['get', 'name:de'], ['get', 'name']];
 const anchor = (id) => ({ id, type: 'background', layout: { visibility: 'none' } });
 const LABEL_LAYERS = ['roads-minor', 'roads-major', 'boundaries', 'street-names', 'house-numbers', 'places-small', 'places-big'];
@@ -258,6 +292,7 @@ const style = {
 		anchor('anchor-clouds'),
 		anchor('anchor-rain'),
 		anchor('anchor-radar'),
+		anchor('anchor-sat'),
 		{
 			id: 'roads-minor',
 			type: 'line',
@@ -435,9 +470,10 @@ map.on('dataloading', syncBounds);
  * übergeblendet, sodass Regen und Wolken fließend ziehen statt zu springen.
  */
 const frames = Object.fromEntries(Object.keys(LAYERS).map((k) => [k, new Map()])); // key → Map(index → frame)
-const stepMs = () => (state.axis === 'radar' ? 260 : 420); // Wiedergabe: Dauer eines Zeitschritts bei vollem Puffer
+const isLive = () => state.axis !== 'model';
+const stepMs = () => (isLive() ? 260 : 420); // Wiedergabe: Dauer eines Zeitschritts bei vollem Puffer
 const FADE_MS = 280; // Überblenden beim manuellen Zeitwechsel
-const lookahead = () => (state.axis === 'radar' ? (SMALL.matches ? 4 : 8) : SMALL.matches ? 3 : state.enabled.size <= 2 ? 6 : 3); // Handy: weniger Speicher
+const lookahead = () => (isLive() ? (SMALL.matches ? 4 : 8) : SMALL.matches ? 3 : state.enabled.size <= 2 ? 6 : 3); // Handy: weniger Speicher
 
 // Liegt der ganze Kartenausschnitt im Gebiet von ICON-D2 (Mitteleuropa, 48 h),
 // wird nur dieses Modell geladen statt zusätzlich ICON-EU und ICON global –
@@ -452,12 +488,12 @@ function updateViewMode() {
 }
 map.on('moveend', updateViewMode);
 function domainFor(index) {
-	if (state.axis === 'radar') return 'radar';
+	if (isLive()) return state.axis;
 	const lead = (state.model.times[index] - Date.parse(state.meta.reference_time)) / 3.6e6;
 	return state.insideD2 && lead <= D2.hours ? D2.domain : MAP_DOMAIN;
 }
 // Radarbilder werden über ihre Uhrzeit erkannt, weil sich die Zeitachse alle 5 Minuten verschiebt
-const frameKey = (index) => (state.axis === 'radar' ? `radar:${state.times[index]}` : `${domainFor(index)}:${index}`);
+const frameKey = (index) => (isLive() ? `${state.axis}:${state.times[index]}` : `${domainFor(index)}:${index}`);
 
 function makeFrame(key, index) {
 	const cfg = LAYERS[key];
@@ -475,6 +511,17 @@ function makeFrame(key, index) {
 			bounds: RADAR_BOUNDS,
 			maxzoom: 10,
 			attribution: 'Radar © Deutscher Wetterdienst'
+		});
+	} else if (key === 'sat') {
+		const time = new Date(frame.time).toISOString();
+		map.addSource(id, {
+			type: 'raster',
+			tiles: [
+				`satcloud://${SAT_WMS.slice(8)}/wms?service=WMS&version=1.3.0&request=GetMap&layers=${SAT_LAYER}&styles=&format=image/jpeg&crs=EPSG:3857&width=512&height=512&bbox={bbox-epsg-3857}&time=${time}`
+			],
+			tileSize: 512,
+			maxzoom: 7,
+			attribution: 'Satellitenbild © EUMETSAT'
 		});
 	} else map.addSource(id, { type: 'raster', url: omUrl(cfg.variable, index, domain) });
 	map.addLayer(
@@ -578,6 +625,7 @@ function setWaiting(waiting) {
 	let text = 'Kartenzeit';
 	if (waiting) text = state.playing ? 'Puffert …' : 'Karte lädt …';
 	else if (state.axis === 'radar') text = state.times[state.timeIndex] > state.radar.latest ? 'Radar · Vorhersage' : 'Radar · Messung';
+	else if (state.axis === 'sat') text = 'Satellit · Aufnahme';
 	if (state.waiting === waiting && $('timeHint').textContent === text) return;
 	state.waiting = waiting;
 	$('play').classList.toggle('loading', waiting);
@@ -598,7 +646,7 @@ function tick(now) {
 	if (!state.ready || !n || (state.axis === 'model' && !state.meta)) return;
 	const zoom = map.getZoom();
 	// Im Radar-Modus ist nur das Radar zu sehen, sonst die gewählten Vorhersage-Ebenen
-	const keys = state.axis === 'radar' ? ['radar'] : Object.keys(LAYERS).filter((k) => state.enabled.has(k));
+	const keys = isLive() ? [state.axis] : Object.keys(LAYERS).filter((k) => state.enabled.has(k));
 	for (const key of Object.keys(LAYERS)) {
 		if (!keys.includes(key)) for (const frame of [...frames[key].values()]) disposeFrame(frame);
 	}
@@ -748,6 +796,10 @@ function refreshLayers() {
 }
 
 function renderLegend() {
+	if (state.axis === 'sat') {
+		$('legend').innerHTML = '<div class="row">Echte Wolken aus dem Satellitenbild (Meteosat, EUMETSAT). Tagsüber in Echtfarben, nachts aus dem Infrarotbild. Auch Schnee erscheint weiß.</div>';
+		return;
+	}
 	if (state.axis === 'radar') {
 		// Farbskala direkt vom DWD-Kartendienst
 		$('legend').innerHTML = `<div class="row">Regenradar (DWD), Niederschlag in mm/h<br /><img class="radarLegend" crossorigin="anonymous" alt="Farbskala des Regenradars" src="${RADAR_WMS}/ows?service=WMS&version=1.3.0&request=GetLegendGraphic&format=image/png&layer=${RADAR_LAYER}" /></div>`;
@@ -782,12 +834,13 @@ function renderTimeline() {
 	slider.value = state.timeIndex;
 	const at = (i) => `left:${(i / Math.max(1, n - 1)) * 100}%`;
 	let html = '';
-	if (state.axis === 'radar') {
-		// Radar: volle Stunden und die Grenze zwischen Messung und Vorhersage
+	if (isLive()) {
+		// Radar/Satellit: volle Stunden und die Grenze zwischen Messung und Vorhersage
 		const hm = fmt({ hour: '2-digit', minute: '2-digit' });
+		const latest = state[state.axis].latest;
 		state.times.forEach((ms, i) => {
-			if (ms === state.radar.latest) html += `<span class="nowTick" style="${at(i)}">jetzt</span>`;
-			else if (ms % 3.6e6 === 0 && Math.abs(ms - state.radar.latest) > 20 * 60e3) html += `<span style="${at(i)}">${hm.format(ms)}</span>`;
+			if (ms === latest) html += `<span class="nowTick" style="${at(i)}">jetzt</span>`;
+			else if (ms % 3.6e6 === 0 && Math.abs(ms - latest) > 20 * 60e3) html += `<span style="${at(i)}">${hm.format(ms)}</span>`;
 		});
 	} else {
 		const dayFmt = fmt({ weekday: 'short', day: '2-digit', month: '2-digit' });
@@ -804,9 +857,119 @@ function renderTimeline() {
 	renderTimeLabel();
 }
 
+/* ------------------------------------------------------------------ *
+ *  Temperaturzahlen auf der Karte
+ *  Unter jedem sichtbaren Ortsnamen steht seine Temperatur: weit weg sind das
+ *  Städte, nah herangezoomt Bezirke und Stadtteile. Sind die Namen
+ *  ausgeblendet, gibt es stattdessen ein Raster aus Punkten.
+ * ------------------------------------------------------------------ */
+const tempCells = new Map(); // "lat,lon" → { at, t0, temps[] } (stündlich)
+let tempPoints = [];
+let tempSig = '';
+let tempTimer = 0;
+let tempReq = 0;
+const TEMP_TTL = 30 * 60e3;
+const tempsOn = () => $('toggleTemps').classList.contains('on');
+
+function tempGrid() {
+	const b = map.getBounds();
+	const south = Math.max(-80, b.getSouth());
+	const north = Math.min(80, b.getNorth());
+	const west = b.getWest();
+	const east = Math.min(b.getEast(), west + 360);
+	// Schrittweite als Zweierpotenz, damit die Punkte beim Verschieben stehen bleiben
+	let step = Math.max(1 / 64, 2 ** Math.ceil(Math.log2((east - west) / 5)));
+	const count = (st) => (Math.floor(east / st) - Math.ceil(west / st) + 1) * (Math.floor(north / (st * 0.625)) - Math.ceil(south / (st * 0.625)) + 1);
+	while (count(step) > 54) step *= 2;
+	const points = [];
+	const dLat = step * 0.625; // in Mitteleuropa etwa quadratische Zellen
+	for (let j = Math.ceil(south / dLat); j * dLat <= north; j++) {
+		for (let i = Math.ceil(west / step); i * step <= east; i++) {
+			const lat = +(j * dLat).toFixed(4);
+			const lon = +((((i * step + 180) % 360) + 360) % 360 - 180).toFixed(4);
+			points.push({ lat, lon, key: `${lat},${lon}` });
+		}
+	}
+	return points;
+}
+
+/** Orte, deren Namen gerade auf der Karte stehen (höchstens 45, ohne Doppelte). */
+function tempPlaces() {
+	const layers = ['places-big', 'places-small'].filter((id) => map.getLayer(id) && map.getLayoutProperty(id, 'visibility') !== 'none');
+	if (!layers.length) return [];
+	const seen = new Set();
+	const points = [];
+	for (const f of map.queryRenderedFeatures({ layers })) {
+		if (f.geometry.type !== 'Point' || points.length >= 45) continue;
+		const lon = +f.geometry.coordinates[0].toFixed(2);
+		const lat = +f.geometry.coordinates[1].toFixed(2);
+		const key = `${lat},${lon}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		points.push({ lat, lon, key, place: true });
+	}
+	return points;
+}
+
+async function updateTemps() {
+	if (!state.ready || !map.getSource('temps')) return;
+	if (!tempsOn()) {
+		tempPoints = [];
+		tempSig = '';
+		return renderTemps();
+	}
+	const places = tempPlaces();
+	const points = places.length >= 3 ? places : tempGrid();
+	const now = Date.now();
+	const missing = points.filter((p) => !(tempCells.get(p.key)?.at > now - TEMP_TTL));
+	const sig = points.map((p) => p.key).join('|');
+	if (sig === tempSig && !missing.length) return; // nichts Neues: nicht neu zeichnen
+	tempSig = sig;
+	tempPoints = points;
+	renderTemps();
+	if (!missing.length) return;
+	const req = ++tempReq;
+	const params = new URLSearchParams({
+		latitude: missing.map((p) => p.lat).join(','),
+		longitude: missing.map((p) => p.lon).join(','),
+		hourly: 'temperature_2m',
+		forecast_days: '7',
+		timeformat: 'unixtime'
+	});
+	try {
+		const res = await fetch(`${FORECAST_API}?${params}`);
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+		const data = [await res.json()].flat();
+		data.forEach((d, i) => {
+			if (missing[i] && d?.hourly) tempCells.set(missing[i].key, { at: now, t0: d.hourly.time[0] * 1000, temps: d.hourly.temperature_2m });
+		});
+		// alte Einträge verwerfen, damit der Speicher nicht wächst
+		if (tempCells.size > 1500) for (const key of [...tempCells.keys()].slice(0, tempCells.size - 1000)) tempCells.delete(key);
+		if (req === tempReq) renderTemps();
+	} catch (err) {
+		console.warn('Temperaturwerte für die Karte nicht erreichbar', err); // der Rest der App läuft weiter
+	}
+}
+
+function renderTemps() {
+	const source = state.ready && map.getSource('temps');
+	if (!source) return;
+	// Radar und Satellit zeigen Messzeiten; dort gelten die Werte der aktuellen Stunde
+	const ms = isLive() ? Date.now() : state.times[state.timeIndex];
+	const features = [];
+	for (const p of tempPoints) {
+		const cell = tempCells.get(p.key);
+		const t = cell?.temps[Math.round((ms - cell.t0) / 3.6e6)];
+		if (t == null) continue;
+		features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: [p.lon, p.lat] }, properties: { label: `${Math.round(t)}°`.replace('-', '−'), t, place: !!p.place } });
+	}
+	source.setData({ type: 'FeatureCollection', features });
+}
+
 function renderTimeLabel() {
 	const ms = state.times[state.timeIndex];
 	if (ms == null) return;
+	renderTemps();
 	$('timeText').textContent = fmt({ weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }).format(ms);
 	// passende Stunde und passenden Tag in der Übersicht markieren
 	const hourMs = Math.round(ms / 3.6e6) * 3.6e6;
@@ -889,7 +1052,7 @@ async function loadMeta() {
 	m.index = 0;
 	for (let i = 1; i < m.times.length; i++) if (Math.abs(m.times[i] - keepMs) < Math.abs(m.times[m.index] - keepMs)) m.index = i;
 	// Bilder des alten Modelllaufs verwerfen
-	for (const key of Object.keys(LAYERS)) if (key !== 'radar') for (const frame of [...frames[key].values()]) disposeFrame(frame);
+	for (const key of Object.keys(LAYERS)) if (!LIVE[key]) for (const frame of [...frames[key].values()]) disposeFrame(frame);
 	if (state.axis !== 'model') return;
 	state.times = m.times;
 	state.timeIndex = state.target = m.index;
@@ -898,33 +1061,34 @@ async function loadMeta() {
 	refreshLayers();
 }
 
-/** Zeitpunkte des Radars: 90 Minuten zurück bis 2 Stunden voraus, alle 5 Minuten. */
-async function loadRadarTimes() {
-	const r = state.radar;
+/** Zeitpunkte von Radar (90 min zurück bis 2 h voraus, alle 5 min) oder Satellit (3 h zurück, alle 10 min). */
+async function loadLiveTimes(axis) {
+	const cfg = LIVE[axis];
+	const r = state[axis];
 	let end = 0;
 	try {
-		// Der Kartendienst nennt den letzten verfügbaren Zeitpunkt (= Ende der Vorhersage)
-		const res = await fetch(`${RADAR_WMS}/${RADAR_LAYER}/wms?service=WMS&version=1.3.0&request=GetCapabilities`);
+		// Der Kartendienst nennt den letzten verfügbaren Zeitpunkt
+		const res = await fetch(`${cfg.caps}?service=WMS&version=1.3.0&request=GetCapabilities`);
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);
-		const match = (await res.text()).match(/<Dimension name="time"[^>]*>[^<]*\/([^/<]+)\/PT5M\s*</);
+		const match = (await res.text()).match(/<Dimension name="time"[^>]*>[^<]*\/([^/<]+)\/PT\d+M\s*</);
 		end = match ? Date.parse(match[1]) : 0;
 	} catch (err) {
-		console.warn('Radar-Zeitangaben nicht erreichbar, rechne mit der Uhrzeit', err);
+		console.warn(`${cfg.name}-Zeitangaben nicht erreichbar, rechne mit der Uhrzeit`, err);
 	}
-	// Notlösung ohne Dienst: Messungen liegen meist rund 5 Minuten zurück
-	if (!end || Math.abs(end - RADAR_FUTURE - Date.now()) > 45 * 60e3) end = Math.floor((Date.now() - 5 * 60e3) / RADAR_STEP) * RADAR_STEP + RADAR_FUTURE;
-	const latest = end - RADAR_FUTURE;
+	// Notlösung ohne Dienst: aus der Uhrzeit und der üblichen Verzögerung
+	if (!end || Math.abs(end - cfg.future - Date.now()) > 90 * 60e3) end = Math.floor((Date.now() - cfg.lag) / cfg.step) * cfg.step + cfg.future;
+	const latest = end - cfg.future;
 	if (latest === r.latest && r.times.length) return;
-	const shownMs = state.axis === 'radar' ? r.times[state.timeIndex] : null;
+	const shownMs = state.axis === axis ? r.times[state.timeIndex] : null;
 	const wasLatest = shownMs === r.latest;
 	r.latest = latest;
 	r.times = [];
-	for (let t = latest - RADAR_PAST; t <= end; t += RADAR_STEP) r.times.push(t);
+	for (let t = latest - cfg.past; t <= end; t += cfg.step) r.times.push(t);
 	r.index = r.times.indexOf(latest);
-	if (state.axis !== 'radar') return;
+	if (state.axis !== axis) return;
 	// Achse hat sich verschoben: vorhandene Bilder ihrer neuen Position zuordnen
 	state.times = r.times;
-	for (const frame of [...frames.radar.values()]) {
+	for (const frame of [...frames[axis].values()]) {
 		const i = r.times.indexOf(frame.time);
 		if (i < 0) disposeFrame(frame);
 		else frame.index = i;
@@ -935,6 +1099,7 @@ async function loadRadarTimes() {
 		state.pos = i;
 	}
 	renderTimeline();
+	renderRadarInfo();
 	kick();
 }
 
@@ -942,11 +1107,11 @@ async function loadRadarTimes() {
 async function setAxis(axis) {
 	if (state.axis === axis) return;
 	if (state.playing) setPlaying(false);
-	if (axis === 'radar') await loadRadarTimes();
+	if (LIVE[axis]) await loadLiveTimes(axis);
 	state[state.axis].index = state.timeIndex;
 	state.axis = axis;
 	state.times = state[axis].times;
-	state.timeIndex = state.target = axis === 'radar' ? state.radar.times.indexOf(state.radar.latest) : state.model.index;
+	state.timeIndex = state.target = LIVE[axis] ? state[axis].times.indexOf(state[axis].latest) : state.model.index;
 	state.pos = state.timeIndex;
 	clearTimeout(timeDebounce);
 	renderChips();
@@ -957,18 +1122,22 @@ async function setAxis(axis) {
 }
 
 function renderChips() {
-	const radar = state.axis === 'radar';
 	for (const btn of document.querySelectorAll('#layerChips button')) {
 		const key = btn.dataset.layer;
-		btn.classList.toggle('on', key === 'radar' ? radar : !radar && state.enabled.has(key));
+		btn.classList.toggle('on', LIVE[key] ? state.axis === key : !isLive() && state.enabled.has(key));
 	}
 }
 
 function renderRadarInfo() {
 	const box = $('radarInfo');
-	box.hidden = state.axis !== 'radar';
+	box.hidden = !isLive();
 	if (box.hidden) return;
 	const hm = fmt({ hour: '2-digit', minute: '2-digit' });
+	if (state.axis === 'sat') {
+		const t = state.sat.times;
+		box.textContent = `Satellitenbild (Meteosat, EUMETSAT) · echte Wolken von ${hm.format(t[0])} bis ${hm.format(state.sat.latest)} Uhr, alle 10 Minuten · ▶ zeigt, wie sie gezogen sind`;
+		return;
+	}
 	const r = state.radar;
 	const parts = [`Regenradar des DWD · Messung bis ${hm.format(r.latest)} Uhr, danach Vorhersage bis ${hm.format(r.times[r.times.length - 1])} Uhr`];
 	if (state.steer) {
@@ -1321,12 +1490,12 @@ $('layerChips').addEventListener('click', async (e) => {
 	const btn = e.target.closest('button[data-layer]');
 	if (!btn) return;
 	const key = btn.dataset.layer;
-	if (key === 'radar') {
-		// Radar hat eine eigene Zeitachse (5-Minuten-Schritte) und ersetzt solange die Vorhersage-Ebenen
-		await setAxis(state.axis === 'radar' ? 'model' : 'radar');
+	if (LIVE[key]) {
+		// Radar und Satellit haben eigene Zeitachsen und ersetzen solange die Vorhersage-Ebenen
+		await setAxis(state.axis === key ? 'model' : key);
 		return;
 	}
-	if (state.axis === 'radar') {
+	if (isLive()) {
 		// zurück zur Vorhersagekarte, die gewählte Ebene ist dann sicher an
 		state.enabled.add(key);
 		await setAxis('model');
@@ -1344,9 +1513,15 @@ $('toggle3d').addEventListener('click', (e) => {
 	map.easeTo({ pitch: on ? 55 : 0, bearing: on ? map.getBearing() : 0, duration: 900 });
 });
 
+$('toggleTemps').addEventListener('click', (e) => {
+	e.currentTarget.classList.toggle('on');
+	updateTemps();
+});
+
 $('toggleLabels').addEventListener('click', (e) => {
 	const on = e.currentTarget.classList.toggle('on');
 	for (const id of LABEL_LAYERS) map.setLayoutProperty(id, 'visibility', on ? 'visible' : 'none');
+	updateTemps();
 });
 
 // Regler von Hand ziehen: Das Kartenbild läuft stufenlos mit (vor und zurück).
@@ -1426,7 +1601,7 @@ $('nowBtn').addEventListener('click', () => {
 
 async function jumpTo(ms) {
 	// Stunden und Tage der Übersicht beziehen sich auf die Vorhersagekarte
-	if (state.axis === 'radar') await setAxis('model');
+	if (isLive()) await setAxis('model');
 	if (!state.times.length) return;
 	if (state.playing) setPlaying(false);
 	const last = state.times[state.times.length - 1];
@@ -1470,6 +1645,34 @@ function startLayers() {
 	}
 	state.ready = true;
 	map.off('styledata', startLayers);
+	map.addSource('temps', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+	map.addLayer({
+		id: 'temps',
+		type: 'symbol',
+		source: 'temps',
+		layout: {
+			'text-field': ['get', 'label'],
+			'text-font': ['Noto Sans Bold'],
+			'text-size': 16,
+			// bei Ortsnamen direkt unter dem Namen, im Raster mittig auf dem Punkt
+			'text-anchor': ['case', ['get', 'place'], 'top', 'center'],
+			'text-offset': ['case', ['get', 'place'], ['literal', [0, 0.8]], ['literal', [0, 0]]],
+			'text-allow-overlap': true,
+			'text-ignore-placement': true
+		},
+		paint: {
+			// Farbe wie die Temperaturskala: blau kalt, grün mild, rot heiß
+			'text-color': ['interpolate', ['linear'], ['get', 't'], -15, '#9db8ff', 0, '#bfe3ff', 10, '#c9f7c0', 20, '#fff3a0', 30, '#ffb37a', 38, '#ff8a8a'],
+			'text-halo-color': 'rgba(5,10,20,.92)',
+			'text-halo-width': 2
+		}
+	});
+	// 'idle': Karte ist fertig gezeichnet, erst dann stehen die sichtbaren Ortsnamen fest
+	map.on('idle', () => {
+		clearTimeout(tempTimer);
+		tempTimer = setTimeout(updateTemps, 250);
+	});
+	updateTemps();
 	updateViewMode();
 	refreshLayers();
 }
@@ -1480,7 +1683,7 @@ setInterval(() => loadMeta().catch(() => {}), 20 * 60 * 1000);
 // Radar, Warnungen und Vorhersage am gewählten Ort regelmäßig auffrischen
 setInterval(() => {
 	if (document.hidden) return;
-	if (state.axis === 'radar') loadRadarTimes();
+	if (isLive()) loadLiveTimes(state.axis);
 	if (state.point) {
 		loadForecast(state.point.lat, state.point.lon);
 		loadAlerts(state.point.lat, state.point.lon);
