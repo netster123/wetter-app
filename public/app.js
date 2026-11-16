@@ -1636,6 +1636,59 @@ for (const [id, cls, open, closed] of [
 	} catch {}
 	apply(saved);
 	btn.addEventListener('click', () => apply(!document.body.classList.contains(cls)));
+
+	// Wischen: Das obere Menü schließt nach oben und öffnet nach unten, das untere umgekehrt.
+	const panel = btn.closest('.side, .bottom');
+	const closeDir = id === 'toggleTop' ? -1 : 1; // -1 = nach oben wischen
+	const isCollapsed = () => document.body.classList.contains(cls);
+	// Lässt sich der Inhalt in Wischrichtung noch blättern, hat das Blättern Vorrang
+	const canScroll = (dir) => (dir < 0 ? panel.scrollTop + panel.clientHeight < panel.scrollHeight - 2 : panel.scrollTop > 2);
+	const swipe = (dir, free) => {
+		if (isCollapsed()) {
+			if (dir === -closeDir) apply(false);
+		} else if (dir === closeDir && free) apply(true);
+		else return false;
+		return true;
+	};
+	let touch = null;
+	panel.addEventListener(
+		'touchstart',
+		(e) => {
+			const t = e.touches[0];
+			// der Zeitregler gehört dem Finger, der ihn zieht
+			touch = e.touches.length === 1 && !e.target.closest('input[type=range]') ? { x: t.clientX, y: t.clientY, at: e.timeStamp, free: !canScroll(closeDir) || !!e.target.closest('.search, .fold') } : null;
+		},
+		{ passive: true }
+	);
+	panel.addEventListener(
+		'touchend',
+		(e) => {
+			if (!touch) return;
+			const t = e.changedTouches[0];
+			const dx = t.clientX - touch.x;
+			const dy = t.clientY - touch.y;
+			const ok = Math.abs(dy) > 36 && Math.abs(dy) > 1.5 * Math.abs(dx) && e.timeStamp - touch.at < 700;
+			if (ok && swipe(Math.sign(dy), touch.free)) e.preventDefault(); // kein Klick auf das, was unter dem Finger lag
+			touch = null;
+		},
+		{ passive: false }
+	);
+	// Trackpad: mit zwei Fingern über dem Menü wischen
+	let wheel = { sum: 0, last: 0, free: false, done: 0 };
+	panel.addEventListener(
+		'wheel',
+		(e) => {
+			if (e.ctrlKey || Math.abs(e.deltaY) < Math.abs(e.deltaX)) return;
+			if (e.timeStamp - wheel.last > 300) wheel = { ...wheel, sum: 0, free: !canScroll(closeDir) || !!e.target.closest('.search, .fold') };
+			wheel.last = e.timeStamp;
+			if (e.timeStamp - wheel.done < 900) return; // Nachlauf der Geste nach dem Umschalten
+			wheel.sum += e.deltaY;
+			// Finger nach oben = Inhalt nach oben = deltaY positiv
+			if (Math.abs(wheel.sum) > 70 && swipe(-Math.sign(wheel.sum), wheel.free)) wheel.done = e.timeStamp;
+			if (Math.abs(wheel.sum) > 70) wheel.sum = 0;
+		},
+		{ passive: true }
+	);
 }
 $('play').addEventListener('click', () => setPlaying(!state.playing));
 $('rew').addEventListener('click', () => wind(-1));
