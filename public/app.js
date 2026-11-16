@@ -457,7 +457,27 @@ const map = new maplibregl.Map({
 	pixelRatio: Math.min(window.devicePixelRatio || 1, 2),
 	attributionControl: false
 });
-window.__map = map; // zum Debuggen in der Konsole
+window.__map = map;
+
+// Mit zwei Fingern verschieben.
+// Trackpad: Zwei-Finger-Wischen verschiebt die Karte (statt zu zoomen); zum
+// Zoomen die Finger spreizen – das meldet der Browser als Mausrad mit „Strg“.
+// Ein echtes Mausrad zoomt weiterhin.
+const isMouseWheel = (e) => e.deltaMode !== 0 || (e.deltaX === 0 && e.wheelDeltaY !== undefined && Math.abs(e.wheelDeltaY) >= 120 && e.wheelDeltaY % 120 === 0);
+map.getContainer().addEventListener(
+	'wheel',
+	(e) => {
+		if (e.ctrlKey || e.metaKey || isMouseWheel(e)) return; // Zoomen bleibt bei der Karte
+		e.preventDefault();
+		e.stopPropagation();
+		map.panBy([e.deltaX, e.deltaY], { animate: false });
+	},
+	{ capture: true, passive: false }
+);
+// iPhone: Zwei Finger verschieben und zoomen die Karte. Das Kippen mit zwei
+// Fingern ist dafür abgeschaltet, sonst würde es das Verschieben abfangen;
+// gekippt wird über den Knopf „3D-Ansicht“.
+map.touchPitch.disable(); // zum Debuggen in der Konsole
 map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right');
 map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right');
 const SMALL = window.matchMedia('(max-width: 760px)');
