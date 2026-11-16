@@ -23,7 +23,15 @@ for (const file of ['app.js', 'style.css']) {
 	if (!html.includes(`"${file}"`)) throw new Error(`${file} nicht in index.html gefunden`);
 	html = html.replace(`"${file}"`, `"${file}?v=${hash}"`);
 }
+// Stand der App: steht in der Seite und in version.json. Die App vergleicht beide
+// beim Öffnen und lädt sich neu, wenn online eine neuere Fassung liegt – wichtig
+// für die Home-Bildschirm-App auf dem iPhone, die sonst lange die alte behält.
+const stamp = new Intl.DateTimeFormat('de-DE', { timeZone: 'Europe/Berlin', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date()).replace(',', '');
+const version = `${stamp} (${createHash('sha1').update(html).digest('hex').slice(0, 6)})`;
+if (!html.includes('name="app-version" content="dev"')) throw new Error('app-version nicht in index.html gefunden');
+html = html.replace('name="app-version" content="dev"', `name="app-version" content="${version}"`);
 await writeFile(`${dist}/index.html`, html);
+await writeFile(`${dist}/version.json`, JSON.stringify({ version }));
 
 // Dieselben Header wie server.mjs (Format von Netlify und Cloudflare Pages)
 await writeFile(

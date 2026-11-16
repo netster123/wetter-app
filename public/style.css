@@ -995,3 +995,39 @@ body.top-collapsed .search > .fold {
 body.bottom-collapsed .bottom > .fold {
 	background: none;
 }
+
+/* ---------- Seite steht fest: nur Karte und Menüs reagieren auf Finger ---------- */
+html,
+body {
+	position: fixed;
+	inset: 0;
+	overscroll-behavior: none; /* kein Mitziehen oder Nachfedern der ganzen Seite */
+	-webkit-text-size-adjust: 100%;
+}
+
+.side,
+.bottom {
+	touch-action: pan-x pan-y; /* blättern ja, aber kein Zoomen der ganzen Seite mit zwei Fingern */
+	overscroll-behavior: contain;
+}
+
+.fold {
+	touch-action: none; /* Wischen auf dem Knopf gehört dem Ein- und Ausklappen */
+}
+
+@media (max-width: 760px) {
+	/* Eingeklappt sitzt der Knopf höher und ist größer: Wischen ganz am unteren
+	   Bildschirmrand gehört dem iPhone (App schließen) und lässt sich nicht abfangen. */
+	body.bottom-collapsed .bottom {
+		bottom: calc(env(safe-area-inset-bottom, 0px) + 30px);
+	}
+
+	body.bottom-collapsed .bottom > .fold {
+		padding: 10px 18px;
+		font-size: 14px;
+	}
+
+	body.top-collapsed .search > .fold {
+		padding: 10px 16px;
+	}
+}

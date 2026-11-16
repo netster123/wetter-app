@@ -916,6 +916,7 @@ let tempSig = '';
 let tempTimer = 0;
 let tempReq = 0;
 const TEMP_TTL = 30 * 60e3;
+const WIND_ARROWS = ['↓', '↙', '←', '↖', '↑', '↗', '→', '↘']; // Wind aus N, NO, O, …
 const tempsOn = () => $('toggleTemps').classList.contains('on');
 
 function tempGrid() {
@@ -979,7 +980,7 @@ async function updateTemps() {
 	const params = new URLSearchParams({
 		latitude: missing.map((p) => p.lat).join(','),
 		longitude: missing.map((p) => p.lon).join(','),
-		hourly: 'temperature_2m',
+		hourly: 'temperature_2m,wind_speed_10m,wind_direction_10m',
 		forecast_days: '7',
 		timeformat: 'unixtime'
 	});
@@ -988,7 +989,7 @@ async function updateTemps() {
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);
 		const data = [await res.json()].flat();
 		data.forEach((d, i) => {
-			if (missing[i] && d?.hourly) tempCells.set(missing[i].key, { at: now, t0: d.hourly.time[0] * 1000, temps: d.hourly.temperature_2m });
+			if (missing[i] && d?.hourly) tempCells.set(missing[i].key, { at: now, t0: d.hourly.time[0] * 1000, temps: d.hourly.temperature_2m, wind: d.hourly.wind_speed_10m, dir: d.hourly.wind_direction_10m });
 		});
 		// alte Einträge verwerfen, damit der Speicher nicht wächst
 		if (tempCells.size > 1500) for (const key of [...tempCells.keys()].slice(0, tempCells.size - 1000)) tempCells.delete(key);
@@ -1006,9 +1007,13 @@ function renderTemps() {
 	const features = [];
 	for (const p of tempPoints) {
 		const cell = tempCells.get(p.key);
-		const t = cell?.temps[Math.round((ms - cell.t0) / 3.6e6)];
+		const h = cell ? Math.round((ms - cell.t0) / 3.6e6) : -1;
+		const t = cell?.temps[h];
 		if (t == null) continue;
-		features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: [p.lon, p.lat] }, properties: { label: `${Math.round(t)}°`.replace('-', '−'), t, place: !!p.place } });
+		// Wind: Pfeil zeigt, wohin er weht (gemeldet wird, woher er kommt), passend zur Kartendrehung
+		const speed = cell.wind?.[h];
+		const wind = speed == null ? '' : `${WIND_ARROWS[((Math.round((cell.dir[h] - map.getBearing()) / 45) % 8) + 8) % 8]} ${Math.round(speed)} km/h`;
+		features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: [p.lon, p.lat] }, properties: { label: `${Math.round(t)}°`.replace('-', '−'), wind, t, place: !!p.place } });
 	}
 	source.setData({ type: 'FeatureCollection', features });
 }
@@ -1603,6 +1608,27 @@ $('time').addEventListener('input', (e) => {
 	kick();
 });
 
+// Stand der App anzeigen und auf neue Fassungen prüfen. Liegt online eine neuere,
+// lädt sich die App einmal selbst neu (statt die zwischengespeicherte zu behalten).
+const APP_VERSION = document.querySelector('meta[name="app-version"]')?.content || 'dev';
+if (APP_VERSION !== 'dev') $('appVersion').textContent = ` · Stand ${APP_VERSION}`;
+async function checkVersion() {
+	if (APP_VERSION === 'dev') return;
+	try {
+		const res = await fetch(`version.json?t=${Date.now()}`, { cache: 'no-store' });
+		const { version } = await res.json();
+		if (!version || version === APP_VERSION || sessionStorage.getItem('reloaded-for') === version) return;
+		sessionStorage.setItem('reloaded-for', version); // höchstens ein Versuch je Fassung
+		location.replace(`${location.pathname}?v=${encodeURIComponent(version)}`);
+	} catch {
+		// offline oder Dienst nicht erreichbar: einfach mit der vorhandenen Fassung weiterlaufen
+	}
+}
+checkVersion();
+document.addEventListener('visibilitychange', () => {
+	if (!document.hidden) checkVersion();
+});
+
 // Menüs ein- und ausklappen; die Wahl bleibt gespeichert
 for (const [id, cls, open, closed] of [
 	['toggleTop', 'top-collapsed', '▴', '▾ Menü'],
@@ -1751,9 +1777,11 @@ function startLayers() {
 		type: 'symbol',
 		source: 'temps',
 		layout: {
-			'text-field': ['get', 'label'],
+			// Zeile 1: Temperatur, Zeile 2 (kleiner): Windrichtung und -geschwindigkeit
+			'text-field': ['format', ['get', 'label'], {}, '\n', {}, ['get', 'wind'], { 'font-scale': 0.72 }],
 			'text-font': ['Noto Sans Bold'],
 			'text-size': 16,
+			'text-line-height': 1.05,
 			// bei Ortsnamen direkt unter dem Namen, im Raster mittig auf dem Punkt
 			'text-anchor': ['case', ['get', 'place'], 'top', 'center'],
 			'text-offset': ['case', ['get', 'place'], ['literal', [0, 0.8]], ['literal', [0, 0]]],

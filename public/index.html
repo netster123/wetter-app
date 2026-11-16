@@ -5,6 +5,8 @@
 		<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 		<title>Wetter</title>
 		<meta name="theme-color" content="#05080f" />
+		<!-- Wird beim Veröffentlichen durch den Stand der App ersetzt (scripts/build.mjs) -->
+		<meta name="app-version" content="dev" />
 		<meta name="apple-mobile-web-app-capable" content="yes" />
 		<meta name="mobile-web-app-capable" content="yes" />
 		<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -69,7 +71,7 @@
 				<div class="chips view">
 					<button id="toggle3d" class="on">3D-Ansicht</button>
 					<button id="toggleLabels" class="on">Straßen &amp; Namen</button>
-					<button id="toggleTemps" class="on">Temperaturwerte</button>
+					<button id="toggleTemps" class="on">Temperatur &amp; Wind</button>
 				</div>
 				<div id="legend" class="legend"></div>
 			</section>
@@ -97,7 +99,7 @@
 			<div id="hours" class="hours"></div>
 			<div class="credits">
 				Wetterdaten: <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> (CC BY 4.0), Deutscher Wetterdienst · Warnungen:
-				<a href="https://brightsky.dev/" target="_blank" rel="noopener">Bright Sky</a> · Radar: DWD · Satellitenbild: <a href="https://view.eumetsat.int/" target="_blank" rel="noopener">EUMETSAT</a>
+				<a href="https://brightsky.dev/" target="_blank" rel="noopener">Bright Sky</a> · Radar: DWD · Satellitenbild: <a href="https://view.eumetsat.int/" target="_blank" rel="noopener">EUMETSAT</a><span id="appVersion"></span>
 			</div>
 		</section>
 
