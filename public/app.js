@@ -227,24 +227,64 @@ maplibregl.addProtocol('om', (params, abort) => OM.omProtocol(params, abort, set
 // Satellitenbild → nur die Wolken: Der Dienst liefert ein fertiges Bild samt
 // Erdoberfläche. Helle, farblose Bildpunkte sind Wolken (oder Schnee); alles
 // andere wird durchsichtig, damit darunter die eigene Karte sichtbar bleibt.
+// Für den 3D-Eindruck bekommen die Wolken zusätzlich Licht und Schatten: helle
+// Kanten zur Sonne (Nordwesten), dunkle auf der abgewandten Seite und einen
+// Schlagschatten auf dem Boden, als würden sie über der Karte schweben.
+const SAT_PAD = 16; // Rand in Bildpunkten, damit Schatten an Kachelgrenzen nicht abreißen
+const SAT_SHADOW = 9; // Versatz des Schattens nach Südosten
 maplibregl.addProtocol('satcloud', async (params, abort) => {
-	const res = await fetch(params.url.replace('satcloud://', 'https://'), { signal: abort.signal });
+	const url = new URL(params.url.replace('satcloud://', 'https://'));
+	const size = Number(url.searchParams.get('width')) || 512;
+	const box = url.searchParams.get('bbox').split(',').map(Number);
+	const m = ((box[2] - box[0]) / size) * SAT_PAD;
+	const full = size + 2 * SAT_PAD;
+	url.searchParams.set('bbox', [box[0] - m, box[1] - m, box[2] + m, box[3] + m].join(','));
+	url.searchParams.set('width', full);
+	url.searchParams.set('height', full);
+	const res = await fetch(url, { signal: abort.signal });
 	if (!res.ok) throw new Error(`Satellitenbild: HTTP ${res.status}`);
 	const bmp = await createImageBitmap(await res.blob());
-	const canvas = typeof OffscreenCanvas === 'function' ? new OffscreenCanvas(bmp.width, bmp.height) : Object.assign(document.createElement('canvas'), { width: bmp.width, height: bmp.height });
-	const ctx = canvas.getContext('2d', { willReadFrequently: true });
-	ctx.drawImage(bmp, 0, 0);
+	const makeCanvas = (w, h) => (typeof OffscreenCanvas === 'function' ? new OffscreenCanvas(w, h) : Object.assign(document.createElement('canvas'), { width: w, height: h }));
+	const src = makeCanvas(full, full).getContext('2d', { willReadFrequently: true });
+	src.drawImage(bmp, 0, 0, full, full);
 	bmp.close?.();
-	const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
-	const d = img.data;
-	for (let i = 0; i < d.length; i += 4) {
+	const d = src.getImageData(0, 0, full, full).data;
+	// 1. Wolkendichte je Bildpunkt (0…1) und „Höhe“ = Dichte × Helligkeit
+	const alpha = new Float32Array(full * full);
+	const height = new Float32Array(full * full);
+	for (let i = 0, p = 0; i < d.length; i += 4, p++) {
 		const lo = Math.min(d[i], d[i + 1], d[i + 2]);
 		const hi = Math.max(d[i], d[i + 1], d[i + 2]);
 		const t = Math.min(1, Math.max(0, (lo - 0.6 * (hi - lo) - 70) / 105));
-		d[i + 3] = Math.round(255 * t * t * (3 - 2 * t));
+		alpha[p] = t * t * (3 - 2 * t);
+		height[p] = alpha[p] * (hi / 255);
+	}
+	// 2. Ausgabe ohne Rand: Wolke mit Relief, darunter ihr Schatten
+	const out = makeCanvas(size, size);
+	const ctx = out.getContext('2d');
+	const img = ctx.createImageData(size, size);
+	const o = img.data;
+	for (let y = 0; y < size; y++) {
+		for (let x = 0; x < size; x++) {
+			const p = (y + SAT_PAD) * full + x + SAT_PAD;
+			const a = alpha[p];
+			// Gefälle der Wolkenoberfläche in Lichtrichtung, über zwei Weiten gemittelt
+			// (Licht aus Nordwesten: hell, wo die Oberfläche nach Südosten ansteigt)
+			const slope = 0.6 * (height[p + 2 * full + 2] - height[p - 2 * full - 2]) + 0.4 * (height[p + 5 * full + 5] - height[p - 5 * full - 5]);
+			const light = Math.min(1.45, Math.max(0.5, 0.92 + 2.6 * slope + 0.16 * height[p]));
+			const shadow = 0.55 * alpha[p - SAT_SHADOW * full - SAT_SHADOW] * (1 - 0.5 * a);
+			const outA = a + shadow * (1 - a);
+			const k = outA > 0 ? (a / outA) * light : 0; // Schatten ist schwarz, trägt also keine Farbe bei
+			const q = (y * size + x) * 4;
+			const s4 = p * 4;
+			o[q] = Math.min(255, d[s4] * k);
+			o[q + 1] = Math.min(255, d[s4 + 1] * k);
+			o[q + 2] = Math.min(255, d[s4 + 2] * k + 6 * a);
+			o[q + 3] = Math.round(255 * outA);
+		}
 	}
 	ctx.putImageData(img, 0, 0);
-	return { data: await createImageBitmap(canvas) };
+	return { data: await createImageBitmap(out) };
 });
 
 const NAME = ['coalesce', ['get', 'name:de'], ['get', 'name']];
