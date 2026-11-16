@@ -1,0 +1,18 @@
+{
+  "name": "wetter-app",
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "start": "node server.mjs",
+    "build": "node scripts/build.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@openmeteo/weather-map-layer": "^0.3.2",
+    "maplibre-gl": "^6.18.0"
+  },
+  "private": true
+}

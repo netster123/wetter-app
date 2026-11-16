@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="de">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+		<title>Wetter</title>
+		<meta name="theme-color" content="#05080f" />
+		<meta name="apple-mobile-web-app-capable" content="yes" />
+		<meta name="mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+		<meta name="apple-mobile-web-app-title" content="Wetter" />
+		<link rel="manifest" href="manifest.webmanifest" />
+		<link rel="apple-touch-icon" href="icon-180.png" />
+		<link rel="icon" type="image/png" href="icon-192.png" />
+		<link rel="stylesheet" href="vendor/maplibre/maplibre-gl.css" />
+		<link rel="stylesheet" href="style.css" />
+	</head>
+	<body>
+		<div id="map"></div>
+
+		<aside class="side">
+			<div class="search glass">
+				<input id="q" type="search" placeholder="Ort suchen …" autocomplete="off" spellcheck="false" />
+				<button id="locate" title="Mein Standort" aria-label="Mein Standort">
+					<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+						<circle cx="12" cy="12" r="3.5" />
+						<circle cx="12" cy="12" r="8" />
+						<path d="M12 1v3M12 20v3M1 12h3M20 12h3" />
+					</svg>
+				</button>
+				<ul id="results" hidden></ul>
+			</div>
+
+			<section class="now glass" id="now">
+				<div class="place"><span id="placeName">Standort wird ermittelt …</span><small id="placeSub"></small></div>
+				<div class="big">
+					<span id="nowIcon" class="icon">⛅</span>
+					<span id="nowTemp" class="temp">–°</span>
+				</div>
+				<div id="nowDesc" class="desc">&nbsp;</div>
+				<dl class="facts">
+					<div><dt>Gefühlt</dt><dd id="nowFeels">–</dd></div>
+					<div><dt>Regen</dt><dd id="nowRain">–</dd></div>
+					<div><dt>Wind</dt><dd id="nowWind">–</dd></div>
+					<div><dt>Böen</dt><dd id="nowGust">–</dd></div>
+					<div><dt>Wolken</dt><dd id="nowCloud">–</dd></div>
+					<div><dt>Feuchte</dt><dd id="nowHum">–</dd></div>
+				</dl>
+			</section>
+
+			<section class="layers glass">
+				<div class="chips" id="layerChips">
+					<button data-layer="rain" class="on">🌧️ Regen</button>
+					<button data-layer="clouds" class="on">☁️ Wolken</button>
+					<button data-layer="wind">💨 Wind</button>
+					<button data-layer="temp">🌡️ Temperatur</button>
+				</div>
+				<div class="chips view">
+					<button id="toggle3d" class="on">3D-Ansicht</button>
+					<button id="toggleLabels" class="on">Straßen &amp; Namen</button>
+				</div>
+				<div id="legend" class="legend"></div>
+			</section>
+		</aside>
+
+		<section class="bottom glass">
+			<div class="timeline">
+				<button id="rew" class="wind" title="Zurückspulen (nochmal klicken: schneller)" aria-label="Zurückspulen">◀◀</button>
+				<button id="play" title="Abspielen" aria-label="Abspielen">▶</button>
+				<button id="ffw" class="wind" title="Vorspulen (nochmal klicken: schneller)" aria-label="Vorspulen">▶▶</button>
+				<div class="slider">
+					<input id="time" type="range" min="0" max="1" value="0" step="any" />
+					<div id="ticks" class="ticks"></div>
+				</div>
+				<div class="timeLabel">
+					<span id="timeText">–</span>
+					<small id="timeHint">Karte</small>
+				</div>
+				<button id="nowBtn" title="Zur aktuellen Zeit springen">Jetzt</button>
+			</div>
+			<div id="days" class="days"></div>
+			<div id="hours" class="hours"></div>
+		</section>
+
+		<div id="toast" class="toast" hidden></div>
+
+		<script type="module" src="app.js"></script>
+	</body>
+</html>
