@@ -222,7 +222,120 @@ settings.colorScales = {
 		colors: [0, 0.06, 0.14, 0.24, 0.34, 0.45, 0.56, 0.67, 0.78, 0.88, 0.95].map((a) => [255, 255, 255, a])
 	}
 };
-maplibregl.addProtocol('om', (params, abort) => OM.omProtocol(params, abort, settings));
+// Vorhersage-Wolken im 3D-Look. Das Modell liefert nur einen weichen
+// Bedeckungsgrad (0–100 %). Daraus wird ein Wolkenbild: Eine Rauschstruktur
+// bricht die Fläche in einzelne Wolken auf (bei 50 % ist etwa die Hälfte
+// bedeckt), dazu Licht von Nordwesten und ein Schlagschatten auf dem Boden.
+// Die Feinstruktur ist Darstellung, keine Vorhersage einzelner Wolken.
+const NOISE = 1024; // Kantenlänge der kachelbaren Rauschtextur
+let noiseTex = null;
+function cloudNoise() {
+	if (noiseTex) return noiseTex;
+	const hash = (x, y, s) => {
+		let h = Math.imul(x, 374761393) ^ Math.imul(y, 668265263) ^ Math.imul(s, 1274126177);
+		h = Math.imul(h ^ (h >>> 13), 1274126177);
+		return ((h ^ (h >>> 16)) >>> 0) / 4294967295;
+	};
+	const tex = new Float32Array(NOISE * NOISE);
+	// vier Größenstufen: große Wolkenfelder bis feine Quellungen
+	for (const [wave, weight, seed] of [[256, 0.42, 1], [128, 0.28, 2], [64, 0.18, 3], [32, 0.12, 4]]) {
+		const cells = NOISE / wave;
+		for (let y = 0; y < NOISE; y++) {
+			const fy = y / wave;
+			const y0 = Math.floor(fy);
+			const ty = fy - y0;
+			const sy = ty * ty * (3 - 2 * ty);
+			for (let x = 0; x < NOISE; x++) {
+				const fx = x / wave;
+				const x0 = Math.floor(fx);
+				const tx = fx - x0;
+				const sx = tx * tx * (3 - 2 * tx);
+				const x1 = (x0 + 1) % cells;
+				const y1 = (y0 + 1) % cells;
+				const top = hash(x0, y0, seed) + (hash(x1, y0, seed) - hash(x0, y0, seed)) * sx;
+				const bottom = hash(x0, y1, seed) + (hash(x1, y1, seed) - hash(x0, y1, seed)) * sx;
+				tex[y * NOISE + x] += weight * (top + (bottom - top) * sy);
+			}
+		}
+	}
+	// auf 0…1 spreizen (die Summe liegt sonst eng um 0,5)
+	let lo = 1;
+	let hi = 0;
+	for (const v of tex) {
+		if (v < lo) lo = v;
+		if (v > hi) hi = v;
+	}
+	for (let i = 0; i < tex.length; i++) tex[i] = (tex[i] - lo) / (hi - lo);
+	return (noiseTex = tex);
+}
+
+async function cloudTile3d(bitmap, tx, ty) {
+	const size = bitmap.width;
+	const makeCanvas = (w, h) => (typeof OffscreenCanvas === 'function' ? new OffscreenCanvas(w, h) : Object.assign(document.createElement('canvas'), { width: w, height: h }));
+	const canvas = makeCanvas(size, size);
+	const ctx = canvas.getContext('2d', { willReadFrequently: true });
+	ctx.drawImage(bitmap, 0, 0);
+	const img = ctx.getImageData(0, 0, size, size);
+	const d = img.data;
+	const noise = cloudNoise();
+	const pad = SAT_PAD;
+	const full = size + 2 * pad;
+	const dens = new Float32Array(full * full);
+	const height = new Float32Array(full * full);
+	let any = false;
+	for (let y = 0; y < full; y++) {
+		// Rand: Bedeckungsgrad der Kachelkante weiterführen, das Rauschen läuft nahtlos durch
+		const sy = Math.min(size - 1, Math.max(0, y - pad));
+		const ny = (((ty * size + y - pad) % NOISE) + NOISE) % NOISE;
+		for (let x = 0; x < full; x++) {
+			const sx = Math.min(size - 1, Math.max(0, x - pad));
+			const cover = Math.min(1, d[(sy * size + sx) * 4 + 3] / 242); // Farbskala: 100 % ≙ Deckkraft 0,95
+			if (cover <= 0.01) continue;
+			const n = noise[ny * NOISE + ((((tx * size + x - pad) % NOISE) + NOISE) % NOISE)];
+			const thr = 1.15 - 1.3 * cover;
+			const t = Math.min(1, Math.max(0, (n - thr + 0.2) / 0.4));
+			const v = t * t * (3 - 2 * t) * Math.min(1, cover * 6);
+			const p = y * full + x;
+			dens[p] = v;
+			height[p] = v * (0.2 + 0.8 * n);
+			any = true;
+		}
+	}
+	if (!any) return bitmap; // wolkenlos: nichts zu tun
+	for (let y = 0; y < size; y++) {
+		for (let x = 0; x < size; x++) {
+			const p = (y + pad) * full + x + pad;
+			const a = dens[p] * 0.94;
+			const slope = 0.6 * (height[p + 2 * full + 2] - height[p - 2 * full - 2]) + 0.4 * (height[p + 5 * full + 5] - height[p - 5 * full - 5]);
+			const light = Math.min(1.1, Math.max(0.52, 0.8 + 7 * slope + 0.22 * height[p]));
+			const shadow = 0.5 * dens[p - SAT_SHADOW * full - SAT_SHADOW] * (1 - 0.5 * a);
+			const outA = a + shadow * (1 - a);
+			const k = outA > 0 ? (a / outA) * light : 0;
+			const q = (y * size + x) * 4;
+			d[q] = Math.min(255, 238 * k);
+			d[q + 1] = Math.min(255, 241 * k);
+			d[q + 2] = Math.min(255, 247 * k);
+			d[q + 3] = Math.round(255 * outA);
+		}
+	}
+	ctx.putImageData(img, 0, 0);
+	bitmap.close?.();
+	return createImageBitmap(canvas);
+}
+
+maplibregl.addProtocol('om', async (params, abort) => {
+	const res = await OM.omProtocol(params, abort, settings);
+	const tile = /variable=cloud_cover&.*\/(\d+)\/(\d+)\/(\d+)$/.exec(params.url);
+	if (!tile || !res?.data) return res;
+	try {
+		const bitmap = res.data instanceof ArrayBuffer ? (res.data.byteLength ? await createImageBitmap(new Blob([res.data])) : null) : res.data;
+		if (!bitmap || bitmap.width < 8) return res;
+		return { ...res, data: await cloudTile3d(bitmap, Number(tile[2]), Number(tile[3])) };
+	} catch (err) {
+		console.warn('3D-Wolken nicht berechenbar, zeige die einfache Darstellung', err);
+		return res;
+	}
+});
 
 // Satellitenbild → nur die Wolken: Der Dienst liefert ein fertiges Bild samt
 // Erdoberfläche. Helle, farblose Bildpunkte sind Wolken (oder Schnee); alles
